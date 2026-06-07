@@ -74,7 +74,7 @@ Run these M1.1-carryover checks in us-east-1 and show me each result:
 >
 2. Lambda role exists: `aws iam get-role --role-name flight-lambda-role --query "Role.RoleName" --region us-east-1`
 >
-3. Secrets exist: `aws secretsmanager list-secrets --region us-east-1 --query "SecretList[].Name"` — expect `flight/travelpayouts` in the list (no `flight/supabase`).
+3. Secrets exist: `aws secretsmanager list-secrets --region us-east-1 --query "SecretList[].Name"` — expect `flight/travelpayouts` in the list (plus the convenience-cache `flight/github` + `flight/supabase` from the M1.1 prereq).
 >
 4. Both DynamoDB tables ACTIVE: `aws dynamodb describe-table --table-name subscriptions --region us-east-1 --query "Table.TableStatus"` and the same for `notification_history`.
 >

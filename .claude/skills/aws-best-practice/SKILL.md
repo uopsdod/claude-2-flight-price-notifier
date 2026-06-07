@@ -99,17 +99,40 @@ This is the standard way to land bytes in S3 from an `aws`-only connector — fo
 
 ---
 
-### Rule 2 — Store every credential in Secrets Manager; the browser/Vercel holds NO AWS keys
+### Rule 2 — Secrets Manager is the single source of truth for EVERY key — so a fresh Cowork session never re-asks
 
-> **The rule:** `flight/travelpayouts`, `flight/resend`, `flight/stripe` (M2), `flight/telegram` + `flight/anthropic` (M4) live in **Secrets Manager**. Lambdas read them at runtime via `boto3.client("secretsmanager").get_secret_value`. **No keys in code, in env files committed to git, or in the front-end.** The browser only POSTs to API Gateway; only Lambdas touch AWS.
+> **The rule:** **All** API keys/tokens live under **`flight/*` in Secrets Manager** — collected **once**, reused forever. The only credential that must persist *locally* is the **`[default]` AWS profile** (it's how the AWS MCP authenticates); everything else is one `get-secret-value` away. So a new Cowork session re-derives every key from AWS instead of asking you to paste them again. **No keys in code, in committed env files, or anywhere the front-end can be scraped for a *write* secret.**
 
-**Why:** Every other home for a key has a leak story — committed `.env` is indexed by GitHub's secret scanner instantly; a key in client JS is visible in every visitor's network tab. Secrets Manager is KMS-encrypted, IAM-scoped, and `GetSecretValue` is CloudTrail-logged with caller + timestamp. And crucially: **DynamoDB/SQS/S3 need NO secret at all** — the Lambda's IAM role authorizes them. The only things in Secrets Manager are *third-party* keys (Travelpayouts/Resend/Stripe/etc.).
+**The canonical `flight/*` set:**
 
-**How to apply:**
-- `aws secretsmanager create-secret --name flight/travelpayouts --secret-string '{"token":"…"}' --region us-east-1` (token only — the notifier authenticates on the token alone; the optional `marker` affiliate ID is a skippable M1.3 add-on for booking-link commission, not required)
+| Secret | Shape | Introduced | Consumed by |
+|---|---|---|---|
+| `flight/travelpayouts` | `{"token":"…"}` | M1.1 | **Lambda runtime** (parser) |
+| `flight/resend` | `{"api_key":"…","from":"…"}` | M1.3 | **Lambda runtime** (fare-notification) |
+| `flight/stripe` | `{"secret_key":"…","webhook_signing_secret":"…","price_id":"…"}` | M2 | **Lambda runtime** (webhook) |
+| `flight/telegram` | `{"bot_token":"…"}` | M4 | **Lambda runtime** (chat) |
+| `flight/anthropic` | `{"api_key":"sk-ant-…"}` | M4 | **Lambda runtime** (chat) |
+| `flight/github` | `{"pat":"github_pat_…"}` | M1.1 prereq | **session bootstrap** — the Cowork git tool, to push |
+| `flight/supabase` | `{"url":"…","anon_key":"…"}` | M0 | **session recall** — the front-end build env (anon key is **public by design**) |
+
+**Two kinds of secret, treated the same way for storage but not for sensitivity:**
+- **Runtime-read** (travelpayouts/resend/stripe/telegram/anthropic) — a Lambda does `get_secret_value` at runtime; these are real secrets that must never reach the browser.
+- **Convenience-cache** (github/supabase) — stored so a new session recalls them without you re-finding them. The **GitHub PAT is a real write-credential** (treat it like a password; scope it to Contents:RW on the one repo). The **Supabase `anon_key` is public by design** (it ships to the browser in `VITE_SUPABASE_PUBLISHABLE_KEY`) — caching it is for convenience, not secrecy.
+
+**Why:** Every other home for a *write* key has a leak story — committed `.env` is indexed by GitHub's secret scanner instantly; a write key in client JS is visible in every visitor's network tab. Secrets Manager is KMS-encrypted, IAM-scoped, and `GetSecretValue` is CloudTrail-logged. And **DynamoDB/SQS/S3 need NO secret at all** — the Lambda's IAM role authorizes them.
+
+**How to apply — check-then-collect (the SOP every prereq follows):** before asking the student for a key, check whether it already exists and only collect if missing:
+```bash
+# does it already exist? (a new session almost always: yes)
+aws secretsmanager describe-secret --secret-id flight/resend --region us-east-1 --query "Name"
+#   → returns "flight/resend"  ⇒ SKIP collection, it's already stored
+#   → ResourceNotFoundException ⇒ collect the key, then:
+aws secretsmanager create-secret --name flight/resend --secret-string '{"api_key":"re_…","from":"…"}' --region us-east-1
+```
+- To **update** an existing secret, `put-secret-value` (replaces the whole value — include every field).
 - Scope the role's `secretsmanager:GetSecretValue` to `arn:aws:secretsmanager:us-east-1:<ACCOUNT_ID>:secret:flight/*` — **never** `Resource: "*"`.
-- **Chat-retention caveat:** a key briefly appears in the chat transcript on its way to `create-secret`. Fine for course-grade keys (cap spend, rotate at course end). For real production, type values in the console.
-- M3 go-live check greps the deployed front-end for `AKIA…` / `service_role` / any secret → must be absent.
+- **Chat-retention caveat:** a key briefly appears in the transcript on its way to `create-secret`. Because it's now stored **once** (not re-pasted every session), there's far less exposure — but still rotate at course end. For real production, type values in the console.
+- M3 go-live check greps the deployed front-end for `AKIA…` / `service_role` / any *write* secret → must be absent (the Supabase `anon_key` is allowed there — it's public).
 
 ---
 
