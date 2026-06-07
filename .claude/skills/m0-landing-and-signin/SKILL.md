@@ -197,6 +197,8 @@ v1 used **Lovable Cloud** (Lovable's managed auth). Now swap to the student's **
 
 **Verify before moving on:** sign up a brand-new test email on the **live Vercel URL** (not just the Lovable preview), then check Supabase **Authentication → Users** — the new user appears in *the student's own* project (NOT Lovable Cloud).
 
+> 📌 **Save these two values — `VITE_SUPABASE_URL` and the publishable/anon key.** You'll cache them in a `flight/supabase` Secrets Manager secret during the **M1.1 prereq** (AWS isn't set up until then), so a future Cowork session recalls them instead of you hunting them down in the Supabase dashboard again. The anon key is **public by design** (it ships in the browser bundle), so caching it is pure convenience — Supabase stays **auth-only for data**. (See [[aws-best-practice]] Rule 2.)
+
 > **Note for Claude Code:** keep the **publishable/anon key** in the front-end (correct — RLS-protected). The **service-role key is NOT used in M0** at all; it only appears later in the AWS Lambdas (M1.1+) — and even there, DynamoDB uses IAM, not a Supabase key. If the student pastes a service-role key into the front-end, stop them (see [[supabase-best-practice]] Rule 2).
 
 ### Step 5 — Final smoke test
