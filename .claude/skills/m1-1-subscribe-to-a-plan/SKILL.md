@@ -15,7 +15,8 @@ By the end the student has:
    - **Plan B — 台北 ✈ 首爾 (TPE → SEL)**
    - **No dates.** Target customers are budget-driven travelers who don't care *when* they fly — they just want a ticket under their budget. So a subscription is just `(plan, target_price)`, nothing about dates.
 3. An **AWS Lambda `flight-save-subscription`** behind **API Gateway** `POST /subscribe` that validates the form and writes a row to **DynamoDB**. **In M1 there is NO `subscription_status`** — the row's mere existence means "eligible for alerts."
-4. End state: pick a plan + enter a TWD budget → a new subscription row appears in DynamoDB `subscriptions`.
+4. A **read endpoint `flight-list-subscriptions`** behind `GET /subscriptions?email=…` + UI that **shows the subscribed state** (已訂閱 badge + target price + an Update button), so the saved row is reflected back to the user — not write-only.
+5. End state: pick a plan + enter a TWD budget → a row appears in DynamoDB, **and the card shows you're subscribed** on reload.
 
 **Out of scope for M1.1:** the price-fetch loop (M1.2), email (M1.3), Stripe payment (M2). **No payment guard in M1** — anyone who subscribes is eligible (the `subscription_status` field + the paywall are *introduced in M2*). **Also out of scope (deliberately simplified):** letting users choose dates, origins, or other routes — M1 ships exactly two fixed routes.
 
@@ -147,7 +148,7 @@ aws iam put-role-policy --role-name flight-lambda-role --policy-name flight-data
 
 ### Step 4 — Write & deploy the save_subscription Lambda
 
-The handler takes `{email, plan_name, target_price}`, maps `plan_name` → `(origin, destination)`, builds `route = origin-destination`, and `PutItem`s the row to **DynamoDB** — **no `subscription_status` in M1**. It uses **boto3** (already in the Lambda runtime — no layer/secret needed for DynamoDB). (Implementation: `aws/save_subscription/handler.py` + shared `aws/common/ddb.py`; deploy via `scripts/04_deploy_lambdas.sh` or `aws lambda create-function`.)
+The handler takes `{email, plan_name, target_price}`, maps `plan_name` → `(origin, destination)`, builds `route = origin-destination`, and `PutItem`s the row to **DynamoDB** — **no `subscription_status` in M1**. It uses **boto3** (already in the Lambda runtime — no layer/secret needed for DynamoDB).
 
 ```python
 import boto3, json, time
@@ -164,12 +165,26 @@ ddb = boto3.resource("dynamodb").Table("subscriptions")
 #                    "created_at":…, "updated_at":…})   # NO subscription_status — that's M2
 ```
 
-**Verify before moving on:**
+**Deploy — pick your mode** (see [[aws-best-practice]] *Cowork execution constraints*):
+
+- **Cowork (default):** you can't transfer a zip, so deploy the handler as **inline CloudFormation** — a single file, **handler `index.handler`**, **≤4096 chars**:
+  ```bash
+  aws cloudformation create-stack --stack-name flight-save-subscription \
+    --capabilities CAPABILITY_IAM --region us-east-1 \
+    --template-body '{"Resources":{"Fn":{"Type":"AWS::Lambda::Function","Properties":{
+      "FunctionName":"flight-save-subscription","Runtime":"python3.12","Handler":"index.handler",
+      "Role":"arn:aws:iam::<ACCOUNT_ID>:role/flight-lambda-role","Timeout":10,
+      "Code":{"ZipFile":"<your one-file handler, JSON-escaped, named index.handler>"}}}}}'
+  ```
+  Keep it **one file** (PLANS + the put_item inline — no `aws/common/ddb.py` split, or the inline limit/`index.handler` requirement breaks). If you edit the handler later, **re-inline and `update-stack`** — the deployed code is the source of truth, a multi-file local layout will silently diverge.
+- **CLI mode only:** `zip` the handler and `aws lambda create-function --zip-file fileb://fn.zip …` (or `scripts/04_deploy_lambdas.sh`). This path does NOT work in Cowork (the MCP rejects `fileb://` from the workspace).
+
+**Verify before moving on** — invoke, then read the **row** back (don't try to `cat` the invoke output — in Cowork the MCP can't read the file it wrote, and `invoke` chokes on `--query`/`--cli-binary-format`):
 ```bash
 aws lambda invoke --function-name flight-save-subscription \
   --payload '{"body":"{\"email\":\"test@example.com\",\"plan_name\":\"tokyo\",\"target_price\":10000}"}' \
-  /tmp/out.json --region us-east-1 && cat /tmp/out.json
-# then read the row back from DynamoDB:
+  out.json --region us-east-1
+# success = the ROW exists (this is the real check; works in both modes):
 aws dynamodb get-item --table-name subscriptions \
   --key '{"email":{"S":"test@example.com"},"route":{"S":"TPE-TYO"}}' \
   --region us-east-1
@@ -188,6 +203,17 @@ Then add the subscribe UI to the M0 site: **two plan cards** (台北✈東京 / 
 
 **Verify before moving on:** picking 台北✈東京 + entering NT$10,000 on the live site creates a row in DynamoDB with `route` = `TPE-TYO` (no `subscription_status` — that's M2).
 
+### Step 6 — Show the subscribed state (close the loop)
+
+Without this, M1.1 is **write-only**: the user clicks 開始追蹤, a row is created, but the UI never shows they're already subscribed — so on reload the cards look unsubscribed and a re-click silently overwrites the row. Surface the row back to the user.
+
+1. **Read endpoint — `flight-list-subscriptions` Lambda behind `GET /subscriptions?email=…`:** `Query` the table by `email` (the PK) and return the user's rows. Same shared `flight-lambda-role` — the existing DynamoDB `Query` perm already covers it; deploy it the same way as Step 4 (inline CFN in Cowork). Add the route to the same `flight-api` (`GET /subscriptions`, AWS_PROXY, CORS allows `GET`).
+2. **UI:** on dashboard mount, `fetch('<api>/subscriptions?email=<the signed-in email>')` and mark each subscribed plan — a **已訂閱 / Subscribed** badge, the current **target price**, and switch that card's button to **更新目標價 / Update**. Also flip a card to subscribed immediately after a successful `POST`.
+
+> **Security note (include it):** `GET /subscriptions?email=` trusts a **client-supplied email with no auth** — fine for this course's no-guard model, but say so. Production would verify the Supabase JWT inside the Lambda before returning anyone's rows. (Same spirit as the no-payment-guard simplification: M1 favors a working loop over hardening.)
+
+**Verify before moving on:** reload the live site → cards for routes you've subscribed to show the **Subscribed** badge + your target price + an **Update** button. `GET /subscriptions?email=you@x.com` returns your rows (this is a GET, so it's testable straight from a browser or the Cowork web-fetch tool).
+
 ## Things to watch out for
 
 1. **CORS** — the Vercel form is a different origin; without CORS the `fetch` fails silently in the browser. Set it on the HTTP API.
@@ -197,10 +223,11 @@ Then add the subscribe UI to the M0 site: **two plan cards** (台北✈東京 / 
 5. **PutItem overwrites by key** — re-subscribing the same (email, route) overwrites the row (idempotent). **In M2** this watch-out grows teeth: there, a re-subscribe must NOT clobber an existing `subscription_status` (don't knock a paid user back). In M1 there's no status, so a plain overwrite is fine.
 6. **No payment guard in M1** — M1.1 writes no `subscription_status` at all; everyone who subscribes is eligible for alerts. The paywall (status field + Stripe webhook + active-only filter) is *introduced in M2*. Don't add a status here.
 7. **DynamoDB numbers** — `target_price` stored as a Number; boto3's `resource` API wants `Decimal`, not `float`. Convert (`Decimal(str(target_price))`). See [[aws-best-practice]] Rule 3.
+8. **Cowork MCP gotchas** (the ones that bit a real run — see [[aws-best-practice]] *Cowork execution constraints*): no `fileb://` zip from the workspace → **deploy via inline CFN**; you **can't `cat` the `invoke` output** → verify with `get-item`; `lambda invoke` rejects `--query`/`--cli-binary-format`; JMESPath **backtick literals** fail (`SecretList[?starts_with(Name,\`flight/\`)]` errors — use `SecretList[].Name`); **`git clone` needs a native dir**, not the mounted folder.
 
 ## Expected duration
 
-60–90 minutes (first DynamoDB table + first AWS Lambda).
+75–120 minutes (first DynamoDB table + first AWS Lambda + the read-endpoint / subscribed-state UI).
 
 ## Next step
 

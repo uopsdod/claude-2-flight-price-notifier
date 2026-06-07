@@ -1,6 +1,6 @@
 ---
 name: m1-1-subscribe-to-a-plan-prerequisites
-description: One-time setup before M1.1 of the Flight Price Notifier course — clone the M0 GitHub repo into the workspace (with a GitHub PAT + a push→deploy round-trip test), AWS access (the `[default]` profile, user admin-for-cowork), and a Travelpayouts API token. Cowork-first. Use when the student starts M1.1 for the first time, or when `m1-1-subscribe-to-a-plan` / `-checklist` detects the project, AWS access, or the Travelpayouts token is missing.
+description: One-time setup before M1.1 of the Flight Price Notifier course — clone the M0 GitHub repo (into a native dir), AWS access (the `[default]` profile via an admin IAM user), and a Travelpayouts token + marker. Cowork-first; notes the inline-CFN deploy method. Use when the student starts M1.1 for the first time, or when `m1-1-subscribe-to-a-plan` / `-checklist` detects the project, AWS access, or the Travelpayouts token is missing.
 ---
 
 # M1.1 Prerequisites — AWS + Travelpayouts
@@ -13,10 +13,12 @@ This course is run mainly in **Cowork** (no local shell — you talk to a Cowork
 
 Sets up the three things M1.1 needs on top of M0's tooling:
 1. **The project in your workspace** — clone the GitHub repo Lovable created in M0, and confirm the push → Vercel auto-deploy loop works end-to-end.
-2. **AWS access** under the `[default]` profile (user `admin-for-cowork`) (resolve your account ID once with `aws sts get-caller-identity --query Account --output text`).
+2. **AWS access** under the `[default]` profile (an admin IAM user you create; name can differ — confirm with `aws sts get-caller-identity`).
 3. A **Travelpayouts API token** (used to fetch fares — set up now, used heavily in M1.2).
 
 Run once. M1.2/M1.3 reuse the same AWS access + the same repo.
+
+> **Heads-up before you build (Cowork):** the AWS API MCP *has* AWS creds + network, but a built **zip can't cross from the bash/build host into the MCP's workdir** (`fileb://…` only reads the MCP's own dir). So **Lambda code is deployed as inline CloudFormation `Code.ZipFile`** (single file, ≤4096 chars, handler `index.handler`) — the code travels *inside* the API call, no file transfer. The `aws lambda create-function --zip-file fileb://…` flow is **CLI-mode only**. Read [[aws-best-practice]] *Cowork execution constraints* once before M1.1 Step 4 — it's the difference between a smooth run and an hour of "outside allowed working directory" errors.
 
 ## Flow structure (where M1.1 sits)
 
@@ -55,13 +57,16 @@ M1.1 builds the **Product Site → Subscriptions [DynamoDB]** path. This prereq 
 
 M0 left you with a **GitHub repo** (Lovable created it) that auto-deploys to Vercel. From M1.1 on you'll be adding an AWS backend to that same project, so first get the code into your Cowork workspace and prove the **push → auto-deploy** loop works.
 
-**1. Clone the M0 repo into the workspace.** Paste this to the Cowork agent (swap in your own repo URL — the one Lovable created in M0):
+**1. Clone the M0 repo.** Paste this to the Cowork agent (swap in your own repo URL — the one Lovable created in M0):
 
 ask """
 >
 Use the git tool to clone my project from my GitHub repo (e.g. https://github.com/<you>/flight-price-notifier).
+Clone into a **native working directory** (your home dir), NOT the mounted workspace folder — git's locking fails on the FUSE mount (`config.lock: Operation not permitted`).
 >
 """
+
+> The working copy is **ephemeral** — **GitHub + Vercel are the source of truth.** If the sandbox resets, just re-clone. (See [[aws-best-practice]] *Cowork execution constraints* #5.)
 
 **2. Get a GitHub Personal Access Token** so the agent can push back:
 - Go to https://github.com/settings/personal-access-tokens → **Generate new token (fine-grained)**.
@@ -100,7 +105,7 @@ This is the tool Cowork uses to run every `aws` call in the course (it reads you
 ### 1b — Create an admin IAM user + write its key to the `[default]` profile
 
 1. **Sign in to the AWS Console as the *root* user** of your course AWS account (e.g. email `uops...@gmail.com`).
-2. **IAM → Users → Create user** named **`admin-for-cowork`** → attach the **`AdministratorAccess`** policy → create.
+2. **IAM → Users → Create user** (suggested name **`admin-for-cowork`** — any name is fine) → attach the **`AdministratorAccess`** policy → create.
 3. That user → **Security credentials → Create access key → "Command Line Interface (CLI)"** → copy the **Access key ID + Secret access key** (shown **once**).
 4. **Open a Claude Code CLI session** (指令版) and paste this — it writes the `[default]` profile to `~/.aws/credentials` (preserving any other profiles) and tests the connection:
 
@@ -120,15 +125,19 @@ This is the tool Cowork uses to run every `aws` call in the course (it reads you
    >
    """
 
-**Verify:** `aws sts get-caller-identity` returns an Account ID and `Arn .../admin-for-cowork`. After this, the Cowork AWS API MCP can run every course `aws` command (always with `--region us-east-1` — no `--profile` needed, it's `[default]`).
+**Verify:** `aws sts get-caller-identity` returns an Account ID and an `Arn` ending in **your admin user's name** (whatever you named it). That `sts` call — not a hardcoded name — is the source of truth that the `[default]` profile is wired. After this, the Cowork AWS API MCP can run every course `aws` command (always with `--region us-east-1` — no `--profile` needed, it's `[default]`).
 
-> ⚠️ **Root is used only once** — to create the `admin-for-cowork` IAM user. After that, never use root keys. The access key is shown **once**; if you lose it, delete it and make a new one. **Revoke `admin-for-cowork`'s key when the course ends.** The `[default]` profile has no region, which is why every course command pins `--region us-east-1`.
+> ⚠️ **Root is used only once** — to create the admin IAM user. After that, never use root keys. The access key is shown **once**; if you lose it, delete it and make a new one. **Revoke that key when the course ends.** The `[default]` profile has no region, which is why every course command pins `--region us-east-1`.
 
 ## Step 2 — Travelpayouts token
 
+M1.1 (and the fetch API) only need the **token** — collect just that now.
+
 1. Sign up free at https://www.travelpayouts.com/ and connect the **Aviasales** program.
-2. Dashboard → **Profile → API token** → copy the token. (https://app.travelpayouts.com/profile/api-token)
-3. (You'll store it in Secrets Manager during M1.1 Step 2.)
+2. Dashboard → **Profile → API token** → copy the **token**. (https://app.travelpayouts.com/profile/api-token)
+3. (You'll store it as `{"token":…}` in the `flight/travelpayouts` secret during M1.1 Step 2.)
+
+> **Not the marker yet.** The Travelpayouts **marker** (affiliate ID, e.g. `736582`) is only used for **booking-link attribution in the M1.3 alert email** — the fetch API authenticates on the token alone (the token-check URL below returns `"success":true` with no marker). You probably don't have the marker handy now, and forcing it here just means storing a placeholder. **M1.3's prereq collects the marker** and updates this secret when it's actually consumed.
 
 **Verify the token works** — the API accepts the token as a `token=` query param, so it's checkable without a shell:
 
