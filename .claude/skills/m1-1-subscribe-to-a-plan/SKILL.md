@@ -114,16 +114,24 @@ Shows `ACTIVE` with HASH=email, RANGE=route.
 
 ### Step 2 — Store the secret the Lambda needs (check-then-collect)
 
-The parser reads the Travelpayouts **token** from `flight/travelpayouts`. **Check whether it already exists first** — a returning session almost always has it (you collected it in the M1.1 prereq), so don't re-create:
+The parser reads the Travelpayouts **token** from `flight/travelpayouts`. A returning session almost always has it (you collected it in the M1.1 prereq), so check first and only create if missing. Paste to the agent (fill the token in **once** at the top):
 
+ask """
+>
+My Travelpayouts API token (fill this in): <REPLACE_WITH_YOUR_TOKEN>
+>
+Store that token in AWS Secrets Manager as `flight/travelpayouts` (shape: `{"token":"<the token above>"}`). Region us-east-1. Check first, then create if missing:
+>
 ```bash
-# already stored? (skip create if it returns the name)
 aws secretsmanager describe-secret --secret-id flight/travelpayouts --region us-east-1 --query "Name"
-# only if ResourceNotFoundException:
-aws secretsmanager create-secret --name flight/travelpayouts \
-  --secret-string '{"token":"REPLACE"}' \
-  --region us-east-1
 ```
+>
+- If that returns `flight/travelpayouts`, it already exists — skip.
+>
+- If ResourceNotFoundException → `aws secretsmanager create-secret --name flight/travelpayouts --secret-string '{"token":"<the token above>"}' --region us-east-1`
+>
+"""
+
 (Just the **token** — the fetch API authenticates on it alone; no `marker`. DynamoDB needs **no** secret — the Lambda reaches it via its IAM role.)
 
 > **`flight/supabase` exists too — but the Lambda never reads it.** It caches the front-end's `{url, anon_key}` (stored in M0) only so a new session can recall them; Supabase stays **auth-only for data** (the app data lives in DynamoDB, reached by IAM, not a key). See [[aws-best-practice]] Rule 2.

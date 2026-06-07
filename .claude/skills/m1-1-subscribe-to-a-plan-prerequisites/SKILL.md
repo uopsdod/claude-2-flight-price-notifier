@@ -136,21 +136,26 @@ This is the tool Cowork uses to run every `aws` call in the course (it reads you
 
 ### 1c — Store the GitHub PAT in Secrets Manager (so you never re-paste it)
 
-Now that AWS is up, save the PAT from "Set up project" step 2 — once stored, every future Cowork session recalls it instead of asking you again. Paste to the agent (swap in your PAT):
+Now that AWS is up, save the PAT from "Set up project" step 2 — once stored, every future Cowork session recalls it instead of asking you again. Paste to the agent (fill your token in **once** at the top):
 
 ask """
 >
-Store my GitHub PAT in Secrets Manager so future sessions can reuse it (check first, create or update):
+My GitHub Personal Access Token (fill this in): <REPLACE_WITH_YOUR_TOKEN>
+>
+Store that token in AWS Secrets Manager as the `flight/github` secret (shape: `{"pat":"<the token above>"}`) so future Cowork sessions can reuse it. Region us-east-1. Check whether it exists first, then create or update:
 >
 ```bash
 aws secretsmanager describe-secret --secret-id flight/github --region us-east-1 --query "Name"
 ```
 >
-If that errors with ResourceNotFoundException, create it; if it already exists, update it:
+- If that errors with ResourceNotFoundException → `aws secretsmanager create-secret --name flight/github --secret-string '{"pat":"<the token above>"}' --region us-east-1`
+>
+- If it already returned `flight/github` → `aws secretsmanager put-secret-value --secret-id flight/github --secret-string '{"pat":"<the token above>"}' --region us-east-1`
+>
+Then confirm it stored (show me only the name, not the value):
 >
 ```bash
-aws secretsmanager create-secret --name flight/github --secret-string '{"pat":"github_pat_REPLACE"}' --region us-east-1
-# (if it already existed:) aws secretsmanager put-secret-value --secret-id flight/github --secret-string '{"pat":"github_pat_REPLACE"}' --region us-east-1
+aws secretsmanager describe-secret --secret-id flight/github --region us-east-1 --query "Name"
 ```
 >
 """
@@ -159,22 +164,23 @@ aws secretsmanager create-secret --name flight/github --secret-string '{"pat":"g
 
 ### 1d — Cache your Supabase url + anon key in `flight/supabase`
 
-Save the two Supabase values from M0 (`VITE_SUPABASE_URL` + the publishable/anon key) so a future session recalls them. The anon key is **public by design**, so this is a convenience cache, not a runtime secret (no Lambda reads it — Supabase stays auth-only for data). Paste to the agent:
+Save the two Supabase values from M0 (`VITE_SUPABASE_URL` + the publishable/anon key) so a future session recalls them. The anon key is **public by design**, so this is a convenience cache, not a runtime secret (no Lambda reads it — Supabase stays auth-only for data). Paste to the agent (fill the two values in **once** at the top):
 
 ask """
 >
-Cache my Supabase front-end values so future sessions can recall them (check first, create or update):
+My Supabase URL (fill this in): https://<REPLACE>.supabase.co
+>
+My Supabase publishable/anon key (fill this in): <REPLACE_WITH_YOUR_ANON_KEY>
+>
+Cache those two values in AWS Secrets Manager as the `flight/supabase` secret (shape: `{"url":"<the URL above>","anon_key":"<the key above>"}`) so future sessions can recall them. Region us-east-1. Check first, then create or update:
 >
 ```bash
 aws secretsmanager describe-secret --secret-id flight/supabase --region us-east-1 --query "Name"
 ```
 >
-If ResourceNotFoundException, create it; else update it:
+- If ResourceNotFoundException → `aws secretsmanager create-secret --name flight/supabase --secret-string '{"url":"<the URL above>","anon_key":"<the key above>"}' --region us-east-1`
 >
-```bash
-aws secretsmanager create-secret --name flight/supabase --secret-string '{"url":"https://REPLACE.supabase.co","anon_key":"sb_publishable_REPLACE"}' --region us-east-1
-# (if it already existed:) aws secretsmanager put-secret-value --secret-id flight/supabase --secret-string '{"url":"https://REPLACE.supabase.co","anon_key":"sb_publishable_REPLACE"}' --region us-east-1
-```
+- If it already returned `flight/supabase` → `aws secretsmanager put-secret-value --secret-id flight/supabase --secret-string '{"url":"<the URL above>","anon_key":"<the key above>"}' --region us-east-1`
 >
 """
 
