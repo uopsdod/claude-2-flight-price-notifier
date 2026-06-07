@@ -28,6 +28,27 @@ The hard rules apply identically in both — only the command surface differs.
 
 ---
 
+## Cowork execution constraints (read before you deploy)
+
+In Cowork there are **two separate hosts**, and the gap between them — **not** an auth gap — is what bites:
+
+- **The AWS API MCP** *does* have AWS access: it authenticates from `~/.aws/credentials` (the `[default]` profile written in prereqs) and runs every `aws` command. **Creds and network are fine.** Its one limit: a `--zip-file fileb://…` path must be **inside the MCP's own workdir** (`/tmp/aws-api-mcp/workdir`); any other path is rejected ("outside allowed working directory").
+- **The bash/build sandbox** is a *different* host. It can build a zip, but has **no AWS creds and no network route to AWS** (s3/sts/lambda return **HTTP 000**), and **no shared path into the MCP's workdir** — so it can't hand the built zip to the MCP, and can't upload to S3 itself (`aws s3 presign` only mints **GET** URLs).
+
+So `aws lambda create-function --zip-file fileb://fn.zip` fails because **the zip lives on the build host while the MCP can only read its own workdir — a file-transfer gap, not an auth gap.** The other gotchas from a real M1.1 run:
+
+1. **The zip-transfer gap (above):** you can't get a built zip to the MCP. → deploy code **without a file** (inline CFN — see the box below). The `create-function --zip-file fileb://…` flow is **CLI-mode only**.
+2. **The build sandbox has no AWS network:** `curl`/uploads to AWS from it return **HTTP 000**; the web-fetch tool is **GET-only**. (So don't try to upload a layer to S3 from the sandbox.)
+3. **You can't read MCP-written files.** `aws lambda invoke … out.json` writes the response body where you **can't read it back** (no shell to `cat`). **Verify the effect instead** — `get-item` (DynamoDB) or a **GET** endpoint.
+4. **CLI flags that break through the MCP:** `lambda invoke` **rejects `--cli-binary-format`** and **errors on `--query`**; **JMESPath backtick literals fail to parse** (`SecretList[?starts_with(Name,\`flight/\`)]` → "Unknown token"). Use plain `aws lambda invoke … out.json` and `--query "SecretList[].Name"` (no backticks).
+5. **Git on the mounted folder fails.** `git clone`/ops in the mounted workspace folder error (`config.lock: Operation not permitted` — FUSE can't do git's locking). **Clone into a native dir** (the agent's home); treat the working copy as **ephemeral** — GitHub + Vercel are the source of truth.
+
+**→ The Cowork way to deploy Lambda code:** since the zip can't cross the host gap, send the code **inside the API call** — **CloudFormation with inline `Code.ZipFile`**: `aws cloudformation create-stack --template-body '<json>'` where the function code is inline (no file transfer). **Limits: single file, ≤4096 chars, handler `index.handler`.** This is how every M1.x Lambda deploys in Cowork.
+
+> **M1.2 foresight (decide now):** the inline-`ZipFile` trick is capped at **4096 chars / single file**, so it **cannot carry the `stripe`+`requests` layer** M1.2/M2 need. Before M1.2, pre-decide the Cowork layer path — **build + deploy from the student's own terminal (CLI mode)**, or an **S3-based deploy** (upload the layer zip from a machine that *does* have AWS network, then point the layer at the S3 object). Don't discover this at the M1.2 wall.
+
+---
+
 ## Hard rules
 
 ### Rule 1 — Pin `--region us-east-1` on every command (the `[default]` profile has no region)
@@ -47,7 +68,7 @@ The hard rules apply identically in both — only the command surface differs.
 **Why:** Every other home for a key has a leak story — committed `.env` is indexed by GitHub's secret scanner instantly; a key in client JS is visible in every visitor's network tab. Secrets Manager is KMS-encrypted, IAM-scoped, and `GetSecretValue` is CloudTrail-logged with caller + timestamp. And crucially: **DynamoDB/SQS/S3 need NO secret at all** — the Lambda's IAM role authorizes them. The only things in Secrets Manager are *third-party* keys (Travelpayouts/Resend/Stripe/etc.).
 
 **How to apply:**
-- `aws secretsmanager create-secret --name flight/travelpayouts --secret-string '{"token":"…","marker":"736582"}' --region us-east-1`
+- `aws secretsmanager create-secret --name flight/travelpayouts --secret-string '{"token":"…"}' --region us-east-1` (token in M1.1; the `marker` affiliate ID is `put-secret-value`'d in M1.3 when the email's booking link first uses it)
 - Scope the role's `secretsmanager:GetSecretValue` to `arn:aws:secretsmanager:us-east-1:<ACCOUNT_ID>:secret:flight/*` — **never** `Resource: "*"`.
 - **Chat-retention caveat:** a key briefly appears in the chat transcript on its way to `create-secret`. Fine for course-grade keys (cap spend, rotate at course end). For real production, type values in the console.
 - M3 go-live check greps the deployed front-end for `AKIA…` / `service_role` / any secret → must be absent.
@@ -105,10 +126,12 @@ Test with `stripe listen --forward-to <api>/stripe-webhook` + `stripe trigger ch
 
 **Why:** Bundling boto3 bloats the zip and can shadow the runtime's version with a subtly different one → confusing `botocore` errors. Putting a **C-extension** library in a Mac-built zip/layer fails at runtime on Lambda's Linux (`invalid ELF header` / `cannot import name ...`); `stripe`/`requests` are pure-Python so a Mac-built zip works. `travelpayouts.py` and `email_render.py` are stdlib-only by design, so a plain `cp` into the function dir is all that's needed.
 
-**How to apply:**
+**How to apply (CLI mode):**
 - `03_build_layer.sh`: `pip install stripe requests -t python/` → zip → `publish-layer-version`. Nothing else.
 - `04_deploy_lambdas.sh`: `cp flightproxy/travelpayouts.py aws/parser/` and `cp flightproxy/email_render.py aws/fare_notification/` before zipping each function.
 - If you ever need a C-extension dep later, build it with `--platform manylinux2014_x86_64` (or Docker), not on the Mac directly.
+
+**In Cowork** you can't build/transfer a zip (see *Cowork execution constraints* above): single-file Lambdas (M1.1's `save_subscription`, `list_subscriptions`) deploy as **inline CFN `Code.ZipFile`** with **no layer** (they only use boto3, which is in the runtime). The **layer** (`stripe`+`requests`) that M1.2/M2 need **cannot** be inlined — that's the foreseen M1.2 wall; plan the CLI/S3 layer-deploy path before M1.2.
 
 ---
 

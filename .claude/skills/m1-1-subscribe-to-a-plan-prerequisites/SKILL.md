@@ -1,6 +1,6 @@
 ---
 name: m1-1-subscribe-to-a-plan-prerequisites
-description: One-time setup before M1.1 of the Flight Price Notifier course — clone the M0 GitHub repo (into a native dir), AWS access (the `[default]` profile via an admin IAM user), and a Travelpayouts token + marker. Cowork-first; notes the inline-CFN deploy method. Use when the student starts M1.1 for the first time, or when `m1-1-subscribe-to-a-plan` / `-checklist` detects the project, AWS access, or the Travelpayouts token is missing.
+description: One-time setup before M1.1 of the Flight Price Notifier course — clone the M0 GitHub repo (into a native dir), AWS access (the `[default]` profile via an admin IAM user), and a Travelpayouts token (token only — the affiliate marker is deferred to M1.3 where it's used). Cowork-first; notes the inline-CFN deploy method. Use when the student starts M1.1 for the first time, or when `m1-1-subscribe-to-a-plan` / `-checklist` detects the project, AWS access, or the Travelpayouts token is missing.
 ---
 
 # M1.1 Prerequisites — AWS + Travelpayouts

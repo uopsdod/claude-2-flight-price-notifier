@@ -118,10 +118,10 @@ Shows `ACTIVE` with HASH=email, RANGE=route.
 
 ```bash
 aws secretsmanager create-secret --name flight/travelpayouts \
-  --secret-string '{"token":"REPLACE","marker":"736582"}' \
+  --secret-string '{"token":"REPLACE"}' \
   --region us-east-1
 ```
-(The Travelpayouts token + marker are in their dashboard → Profile → API token / the ID in the corner. DynamoDB needs no secret — the Lambda uses its IAM role.)
+(Just the **token** here — it's all M1.1/M1.2 need. The Travelpayouts **marker** (affiliate ID for booking-link attribution) is added to this secret in **M1.3**, when the alert email's `booking_url(marker)` first uses it. DynamoDB needs no secret — the Lambda uses its IAM role.)
 
 **Verify before moving on:** `aws secretsmanager list-secrets --region us-east-1 --query 'SecretList[].Name'` lists `flight/travelpayouts`.
 
