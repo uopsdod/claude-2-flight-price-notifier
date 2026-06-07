@@ -1,0 +1,182 @@
+---
+name: m1-1-subscribe-to-a-plan-prerequisites
+description: One-time setup before M1.1 of the Flight Price Notifier course — clone the M0 GitHub repo into the workspace (with a GitHub PAT + a push→deploy round-trip test), AWS access (the `[default]` profile, user admin-for-cowork), and a Travelpayouts API token. Cowork-first. Use when the student starts M1.1 for the first time, or when `m1-1-subscribe-to-a-plan` / `-checklist` detects the project, AWS access, or the Travelpayouts token is missing.
+---
+
+# M1.1 Prerequisites — AWS + Travelpayouts
+
+## Execution mode: Cowork (default) vs CLI
+
+This course is run mainly in **Cowork** (no local shell — you talk to a Cowork agent that has the git tool, the AWS MCP, and a workspace). The **`ask """ ... """`** blocks below are prompts you **paste to the Cowork agent verbatim**. If you're on the local Claude CLI instead, run the equivalent shell commands directly. Every AWS command uses `--region us-east-1`.
+
+## What this skill does
+
+Sets up the three things M1.1 needs on top of M0's tooling:
+1. **The project in your workspace** — clone the GitHub repo Lovable created in M0, and confirm the push → Vercel auto-deploy loop works end-to-end.
+2. **AWS access** under the `[default]` profile (user `admin-for-cowork`) (resolve your account ID once with `aws sts get-caller-identity --query Account --output text`).
+3. A **Travelpayouts API token** (used to fetch fares — set up now, used heavily in M1.2).
+
+Run once. M1.2/M1.3 reuse the same AWS access + the same repo.
+
+## Flow structure (where M1.1 sits)
+
+M1.1 builds the **Product Site → Subscriptions [DynamoDB]** path. This prereq gets the **repo loop** (bottom strip) and AWS access ready so you can build it.
+
+```
+                       ┌────────────────────┐
+                       │  Database          │   ← Supabase (AUTH ONLY)
+                       │  [Supabase] ⚡     │
+                       └─────────┬──────────┘
+                                 │ sign-in (auth)
+                       ┌─────────▼──────────┐
+                       │   Product Site     │   ← Vercel host (your M0 site)
+                       │   [Vercel host] ▲  │
+                       └─────────┬──────────┘
+                                 │ POST /subscribe
+   ┌──── Flight Fare Checker ────┼──────────────────────────────────┐
+   │                             ▼                                   │
+   │              ┌──────────────────────────┐                      │
+   │              │  Subscriptions           │  ◀── user data (pink)│
+   │              │  [DynamoDB]              │                      │
+   │              └──────────────────────────┘                      │
+   │   (Parser / EventBridge / S3 side of this box = M1.2)          │
+   └────────────────────────────────────────────────────────────────┘
+
+   Legend:  ▮ orange = manual input   ▮ teal = main component   ▮ pink = user data
+   Repo loop:   Landing Page (Lovable) ──▶ Repo (GitHub) ──R──▶ Product Site (Vercel)
+```
+
+## When to load this skill
+
+- "M1.1 環境準備" / "setup AWS for the flight course"
+- Any time M1.1 detects AWS or Travelpayouts is missing.
+
+## Set up project
+
+M0 left you with a **GitHub repo** (Lovable created it) that auto-deploys to Vercel. From M1.1 on you'll be adding an AWS backend to that same project, so first get the code into your Cowork workspace and prove the **push → auto-deploy** loop works.
+
+**1. Clone the M0 repo into the workspace.** Paste this to the Cowork agent (swap in your own repo URL — the one Lovable created in M0):
+
+ask """
+>
+Use the git tool to clone my project from my GitHub repo (e.g. https://github.com/<you>/flight-price-notifier).
+>
+"""
+
+**2. Get a GitHub Personal Access Token** so the agent can push back:
+- Go to https://github.com/settings/personal-access-tokens → **Generate new token (fine-grained)**.
+- **Repository access → Only select repositories** → pick this one repo.
+- **Permissions → Repository permissions → Contents → enable `Read and write`**.
+- Generate and copy the token (`github_pat_...`). It's shown once.
+
+> ⚠️ The token grants write access to this repo. Treat it like a password: don't commit it, don't paste it into a public place. It only needs **Contents: Read/Write** on **this one repo** — nothing else. Revoke it when the course is done.
+
+**3. Run the round-trip test.** Paste this to the Cowork agent (paste your real token in place of the X's):
+
+ask """
+>
+Now, let's do a test. Change the site title to "Flight Price Notifier V3". Then push to the GitHub repo.
+>
+Once done, track the Vercel deployment for me. Then check the final Vercel-deployed site to confirm the title changed.
+>
+Here is my GitHub Personal Access Token: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+>
+"""
+
+**Verify:** the live Vercel site shows the title **"Flight Price Notifier V3"** after the agent pushes and the deploy finishes. That proves: the repo is cloned, the token can push, and GitHub → Vercel auto-deploy is wired. (Change the title back to "Flight Price Notifier" when you're done testing.)
+
+> **Why this matters:** every later milestone edits this repo (the subscribe form in M1.1, etc.) and relies on `git push → Vercel redeploy`. If that loop is broken, nothing you build after will reach the live site — so prove it here, once.
+
+## Step 1 — AWS access (AWS API MCP + the `[default]` profile)
+
+This is the AWS setup for the whole course. Two parts: **install the connector**, then **write credentials** (via a one-time Claude Code CLI session — the Cowork AWS API MCP then reads them).
+
+### 1a — Add the AWS API MCP connector (Cowork)
+
+> **Customize → Connectors → search "AWS API MCP" → Install.**
+
+This is the tool Cowork uses to run every `aws` call in the course (it reads your local `~/.aws/credentials`).
+
+### 1b — Create an admin IAM user + write its key to the `[default]` profile
+
+1. **Sign in to the AWS Console as the *root* user** of your course AWS account (e.g. email `uops...@gmail.com`).
+2. **IAM → Users → Create user** named **`admin-for-cowork`** → attach the **`AdministratorAccess`** policy → create.
+3. That user → **Security credentials → Create access key → "Command Line Interface (CLI)"** → copy the **Access key ID + Secret access key** (shown **once**).
+4. **Open a Claude Code CLI session** (指令版) and paste this — it writes the `[default]` profile to `~/.aws/credentials` (preserving any other profiles) and tests the connection:
+
+   ask """
+   >
+   I have new AWS credentials I want to configure. Please write them to my AWS credentials file. Here are the values:
+   >
+   Access key ID: <YOUR_ACCESS_KEY_ID>
+   >
+   Secret access key: <YOUR_SECRET_ACCESS_KEY>
+   >
+   First, detect whether I'm on Mac/Linux or Windows to determine the correct credentials file path
+   (~/.aws/credentials on Mac/Linux, %USERPROFILE%\.aws\credentials on Windows),
+   then write the [default] profile with the new values — preserving any other existing profiles in the file.
+   >
+   Once done, test the connection using aws sts get-caller-identity.
+   >
+   """
+
+**Verify:** `aws sts get-caller-identity` returns an Account ID and `Arn .../admin-for-cowork`. After this, the Cowork AWS API MCP can run every course `aws` command (always with `--region us-east-1` — no `--profile` needed, it's `[default]`).
+
+> ⚠️ **Root is used only once** — to create the `admin-for-cowork` IAM user. After that, never use root keys. The access key is shown **once**; if you lose it, delete it and make a new one. **Revoke `admin-for-cowork`'s key when the course ends.** The `[default]` profile has no region, which is why every course command pins `--region us-east-1`.
+
+## Step 2 — Travelpayouts token
+
+1. Sign up free at https://www.travelpayouts.com/ and connect the **Aviasales** program.
+2. Dashboard → **Profile → API token** → copy the token. (https://app.travelpayouts.com/profile/api-token)
+3. (You'll store it in Secrets Manager during M1.1 Step 2.)
+
+**Verify the token works** — the API accepts the token as a `token=` query param, so it's checkable without a shell:
+
+- **Cowork** (no CLI) — paste this to the agent (swap in your token):
+
+  ask """
+  >
+  Fetch this URL and tell me whether the JSON has "success":true (it's a Travelpayouts token check):
+  >
+  https://api.travelpayouts.com/v1/prices/cheap?origin=TPE&destination=TYO&depart_date=2026-07&currency=usd&token=<YOUR_TOKEN>
+  >
+  """
+
+  (Or just paste that URL into a browser — if you see `"success":true`, the token is good.)
+
+- **CLI:**
+  ```bash
+  curl -s "https://api.travelpayouts.com/v1/prices/cheap?origin=TPE&destination=TYO&depart_date=2026-07&currency=usd&token=<YOUR_TOKEN>" | head -c 200
+  ```
+
+**Expect** JSON containing `"success":true`. (A `401` / `"success":false` means the token is wrong or the Aviasales program isn't connected yet.)
+
+## Step 3 — Lambda packaging deps
+
+The Lambdas use a shared layer (`stripe` + `requests`, both pure-Python). The zip is built wherever your agent/terminal runs, so `python3` + `pip` + `zip` need to be available there.
+
+- **Cowork** — the **Cowork agent's workspace** builds the zip (it already has python/pip/zip), so there's nothing for you to install. You can confirm with the agent:
+
+  ask """
+  >
+  In the workspace, run: python3 --version && pip3 --version && which zip — and show me the output.
+  >
+  """
+
+- **CLI:**
+  ```bash
+  python3 --version && pip3 --version && which zip
+  ```
+
+(`travelpayouts.py` and `email_render.py` are stdlib-only, so they need no deps — they're copied straight into the zip.)
+
+## Verify (all must pass)
+
+- **Project:** the M0 repo is cloned in the workspace, and the "V3" round-trip showed up on the live Vercel site (then reverted).
+- **AWS:** `sts get-caller-identity` returns your account ID (via the AWS MCP in Cowork, or `aws ...` in CLI).
+- **Travelpayouts:** the Step 2 token check returns JSON `"success":true`.
+- **Build tools:** `python3` + `pip` + `zip` are available in your build environment.
+
+## Next step
+
+Return to `m1-1-subscribe-to-a-plan` Step 1.
