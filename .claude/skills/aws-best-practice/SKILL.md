@@ -21,8 +21,8 @@ The hard rules apply identically in both — only the command surface differs.
 |---|---|---|
 | Run any AWS API call | `aws <service> <verb> ... --region us-east-1` | `call_aws <service> <verb> ...` via AWS API MCP (set region/creds in the connector) |
 | Deploy a 1-file Lambda | `aws lambda create-function --zip-file fileb://fn.zip ...` | inline CFN `Code.ZipFile` (Method 1 below) — no file transfer |
-| Deploy a multi-file Lambda | `zip` the dir → `--zip-file fileb://fn.zip` | S3: MCP zips in its workdir → `s3 cp` → CFN `Code.S3Bucket/S3Key` (Method 2 below) |
-| Read a Lambda's logs | `aws logs tail /aws/lambda/<fn> --since 10m --follow` | `call_aws logs tail ...` or the CloudWatch console |
+| Deploy a >4096-char / layered Lambda | `zip` the dir → `--zip-file fileb://fn.zip` | S3 via the `flight-seed` base64 bridge → `Code.S3Bucket/S3Key` (Method 2 below) |
+| Read a Lambda's logs | `aws logs tail /aws/lambda/<fn> --since 10m --follow` | `aws logs filter-log-events --log-group-name /aws/lambda/<fn> --query "events[].message"` (the MCP rejects `logs tail`) |
 | Inspect a DynamoDB row | `aws dynamodb get-item --table-name subscriptions --key '{...}'` | `call_aws dynamodb get-item ...` |
 
 **Profile/region:** the course uses the **`[default]`** AWS profile (no `--profile` flag needed). It has **no default region**, so **every** call passes `--region us-east-1`. In Cowork the AWS API MCP reads `~/.aws/credentials`'s `[default]` block (written via a Claude CLI session — see [[m1-1-subscribe-to-a-plan-prerequisites]]). Forgetting the region is the #1 "it works for me but not in the script" gap.
@@ -33,28 +33,57 @@ The hard rules apply identically in both — only the command surface differs.
 
 In Cowork there are **two separate hosts**, and the gap between them — **not** an auth gap — is what bites:
 
-- **The AWS API MCP** *does* have AWS access: it authenticates from `~/.aws/credentials` (the `[default]` profile written in prereqs) and runs every `aws` command. **Creds and network are fine.** Its one limit: a `--zip-file fileb://…` path must be **inside the MCP's own workdir** (`/tmp/aws-api-mcp/workdir`); any other path is rejected ("outside allowed working directory").
-- **The bash/build sandbox** is a *different* host. It can build a zip, but has **no AWS creds and no network route to AWS** (s3/sts/lambda return **HTTP 000**), and **no shared path into the MCP's workdir** — so it can't hand the built zip to the MCP, and can't upload to S3 itself (`aws s3 presign` only mints **GET** URLs).
+- **The AWS API MCP** *does* have AWS access: it authenticates from `~/.aws/credentials` (the `[default]` profile written in prereqs) and runs `aws` calls. **Creds and network are fine.** But — verified on a real M1.2 run — the common connector is **`aws`-CLI-only: it executes `aws` API commands and nothing else.** It has **no shell**, so it **cannot author files, run `zip`, or `cat` an output** in any workdir. (Some connector builds *do* expose a writable workdir; **don't assume it** — see the capability fork below.)
+- **The bash/build sandbox** is a *different* host. It can build a zip, but has **no AWS creds and no network route to AWS** (DNS to `*.amazonaws.com` is blackholed; s3/sts/lambda return **HTTP 000**), and **no shared path to the connector** — so it can't hand the built zip to the MCP, and can't upload to S3 itself.
 
-So `aws lambda create-function --zip-file fileb://fn.zip` fails because **the zip lives on the build host while the MCP can only read its own workdir — a file-transfer gap, not an auth gap.** The other gotchas from a real M1.1 run:
+So you **cannot** get a built zip to S3 by any direct path: the sandbox has the file but no network; the MCP has the network but can't author the file. The bridge that closes this gap is a tiny **`flight-seed` Lambda** (Method 2 below). Other gotchas from real runs:
 
-1. **The zip-transfer gap (above):** you can't get a built zip to the MCP. → deploy code **without a file** (inline CFN — see the box below). The `create-function --zip-file fileb://…` flow is **CLI-mode only**.
-2. **The build sandbox has no AWS network:** `curl`/uploads to AWS from it return **HTTP 000**; the web-fetch tool is **GET-only**. (So don't try to upload a layer to S3 from the sandbox.)
-3. **You can't read MCP-written files.** `aws lambda invoke … out.json` writes the response body where you **can't read it back** (no shell to `cat`). **Verify the effect instead** — `get-item` (DynamoDB) or a **GET** endpoint.
-4. **CLI flags that break through the MCP:** `lambda invoke` **rejects `--cli-binary-format`** and **errors on `--query`**; **JMESPath backtick literals fail to parse** (`SecretList[?starts_with(Name,\`flight/\`)]` → "Unknown token"). Use plain `aws lambda invoke … out.json` and `--query "SecretList[].Name"` (no backticks).
+1. **The zip-transfer gap (above):** no direct file→S3 path. → single small files deploy **inline** (Method 1); anything bigger goes through the **`flight-seed` base64→S3 bridge** (Method 2).
+2. **The build sandbox has no AWS network:** `curl`/uploads to AWS from it return **HTTP 000**; the web-fetch tool is **GET-only**.
+3. **You can't read MCP-written files.** `aws lambda invoke … out.json` writes the response body where you **can't `cat` it back**. **Verify the effect instead** — `get-item` (DynamoDB), a queue depth, or `logs filter-log-events`.
+4. **The MCP's command surface ≠ the full CLI.** It runs core AWS **API operations**, not the CLI's convenience wrappers or client-side binary handling. Verified rejections/quirks (every milestone inherits these):
+   - `aws logs tail` → **rejected** ("operation 'tail' does not exist"). Use **`aws logs filter-log-events --log-group-name … --query "events[].message"`** (optional `--start-time <epoch_ms>`).
+   - `aws cloudformation wait …` → **rejected** ("operation 'wait' is not allowed"). **Poll** `describe-stacks --query "Stacks[0].StackStatus"` until `CREATE_COMPLETE` (sleep between calls).
+   - `aws lambda invoke` → **rejects `--query` and `--cli-binary-format`.** And **`--payload` is forwarded RAW, not base64** — send plain JSON (`'{"k":"v"}'`); base64-encoding it fails with `InvalidRequestContentException`.
+   - **JMESPath backtick literals fail to parse** anywhere (`SecretList[?starts_with(Name,\`flight/\`)]` → "Unknown token"). Use plain projections: `--query "SecretList[].Name"`.
+   - **`s3api put-object` Body can't be inlined.** `--cli-input-json '{"Body":"…"}'` is a streaming blob the CLI **silently drops → a 0-byte object**, and there's **no `--body <file>`** to point at without a shell. This is *why* the `flight-seed` bridge exists, not a clever one-liner.
 5. **Git on the mounted folder fails.** `git clone`/ops in the mounted workspace folder error (`config.lock: Operation not permitted` — FUSE can't do git's locking). **Clone into a native dir** (the agent's home); treat the working copy as **ephemeral** — GitHub + Vercel are the source of truth.
 
 **→ The Cowork way to deploy Lambda code (two methods):**
 
 **Method 1 — inline `Code.ZipFile` (single small file).** Send the code *inside* the API call — **CloudFormation with inline `Code.ZipFile`**: `aws cloudformation create-stack --template-body '<json>'`, function code inline, no file transfer. **Limits: single file, ≤4096 chars, handler `index.handler`.** This is how M1.1's one-file Lambdas (`save_subscription`, `list_subscriptions`) deploy — they use only boto3 (already in the runtime), so no extra files.
 
-**Method 2 — S3 `Code.S3Bucket/S3Key` (multi-file or >4096 chars).** When a Lambda needs **more than one file** (e.g. M1.2's parser = `index.py` + `travelpayouts.py` + `routes.py`) or one file **exceeds 4096 chars** (`travelpayouts.py` alone is ~7.4 KB), inline won't fit. The fix stays inside Cowork because **the AWS API MCP has both AWS network AND a writable workdir** — so the MCP can build the zip itself and upload it, with no build-host involved:
+**Method 2 — S3 `Code.S3Bucket/S3Key` via the `flight-seed` bridge (>4096 chars or a layer zip).** When a function's code **exceeds the inline 4096-char cap**, or you need to land a **layer zip** (M2's `stripe`+`requests`) or any other bytes in S3, inline won't fit and `s3api put-object` can't take an inline body (see constraint #4). **First check your connector** (capability fork):
 
-1. Ask the MCP to **write the handler files into its own workdir** (`/tmp/aws-api-mcp/workdir`) — it can create files there.
-2. Ask it to **`zip`** them and **`aws s3 cp parser.zip s3://flight-config-<ACCOUNT_ID>/lambda/parser.zip`** (reuses the bucket M1.2 already makes; the MCP has creds+network, so this `cp` works — unlike the build sandbox, which returns HTTP 000).
-3. Deploy with **CloudFormation `Code:{S3Bucket,S3Key}`** (or `aws lambda create-function --code S3Bucket=…,S3Key=…`). Lambda fetches the object **server-side from S3** — no `fileb://`, no host gap. Redeploy after an edit = re-`cp` the new zip + `aws lambda update-function-code --s3-bucket … --s3-key …`.
+- **`aws`-only connector (the common case):** use the **`flight-seed` bridge** below — it's the only path that works.
+- **Connector with a writable shell workdir (rare):** you *may* instead author the files there, `zip`, and `aws s3 cp` directly — but if you're unsure, use the bridge; it works in both.
 
-This is the standard deploy for **every multi-file or layered Lambda** from M1.2 on. (M1.2's `travelpayouts.py` is **stdlib-only** — `urllib`, not `requests` — so the parser needs **no layer**, just these multiple stdlib files. The `stripe`+`requests` **layer** is an **M2-only** concern; publish it the same S3 way — `aws s3 cp layer.zip …` from the MCP workdir, then `publish-layer-version --content S3Bucket=…,S3Key=…`.)
+**The `flight-seed` base64→S3 bridge** (canonical for `aws`-only connectors):
+
+1. **Deploy a tiny `flight-seed` Lambda once**, via inline CFN `Code.ZipFile` (it fits — it's ~6 lines):
+   ```python
+   import base64, boto3
+   def handler(e, c):
+       boto3.client("s3").put_object(
+           Bucket=e["bucket"], Key=e["key"],
+           Body=base64.b64decode(e["b64"]),
+           ContentType=e.get("ct", "application/octet-stream"))
+       return {"ok": True, "key": e["key"]}
+   ```
+   Its role needs **`s3:PutObject`** on the target bucket (add it to `flight-lambda-role`, or give `flight-seed` its own role).
+2. **Build each zip in the sandbox** (it has `zip`), then `base64 -w0` it to a single line.
+3. **Materialize each object in S3** by invoking the bridge with **raw JSON** (the MCP forwards `--payload` verbatim — do **not** base64 the payload itself):
+   ```bash
+   aws lambda invoke --function-name flight-seed \
+     --payload '{"bucket":"flight-config-<ACCOUNT_ID>","key":"lambda/parser.zip","b64":"<BASE64_OF_ZIP>","ct":"application/zip"}' \
+     /tmp/aws-api-mcp/workdir/out.json --region us-east-1
+   ```
+   (Use the same bridge to write `flight-routes.json`, layer zips — any bytes.)
+4. **Deploy the function from S3:** `aws lambda create-function --code S3Bucket=flight-config-<ACCOUNT_ID>,S3Key=lambda/parser.zip …` (or CFN `Code:{S3Bucket,S3Key}`). Redeploy after an edit = re-seed the new zip, then `aws lambda update-function-code --s3-bucket … --s3-key …`.
+
+> **Always verify the uploaded object size == the local zip size** — a mangled base64 paste yields a same-name object that fails at deploy with `InvalidZipFileException`. And a function whose create **failed** on a bad zip is stuck `State=Failed` — `update-function-code` is blocked; you must **delete and recreate** it.
+
+This is the standard way to land bytes in S3 from an `aws`-only connector — for both **>4096-char function zips** and the **M2 `stripe`+`requests` layer** (`publish-layer-version --content S3Bucket=…,S3Key=…` after seeding `layer.zip`). Note most M1.x functions actually **fold into a single `index.py`** that only uses boto3/stdlib — they need **no layer**; the reason to use S3 is the size cap (and the checklist's S3-artifact check), not file count.
 
 ---
 
@@ -141,9 +170,9 @@ Test with `stripe listen --forward-to <api>/stripe-webhook` + `stripe trigger ch
 - If you ever need a C-extension dep later, build it with `--platform manylinux2014_x86_64` (or Docker), not on the Mac directly.
 
 **In Cowork** the build-sandbox can't hand a zip to the MCP (see *Cowork execution constraints* above), so:
-- **Single-file Lambdas** (M1.1's `save_subscription`, `list_subscriptions`) deploy as **inline CFN `Code.ZipFile`** with **no layer** (they only use boto3, in the runtime).
-- **Multi-file Lambdas** (M1.2's `parser` = `index.py`+`travelpayouts.py`+`routes.py`) deploy via **S3** (Method 2 above): the MCP writes the files into its workdir, zips, `s3 cp`s, and CFN points `Code` at the S3 object. **M1.2 needs no layer** — `travelpayouts.py` is stdlib-only.
-- **The `stripe`+`requests` layer** is an **M2** need, not M1.2. Publish it the same S3 way (MCP workdir → `s3 cp layer.zip` → `publish-layer-version --content S3Bucket=…,S3Key=…`).
+- **Small single-file Lambdas** (M1.1's `save_subscription`, `list_subscriptions`; M1.2's `flight-seed`) deploy as **inline CFN `Code.ZipFile`** with **no layer** (they only use boto3/stdlib, in the runtime). M1.2's `parser`/`wrapper` also **fold into one `index.py` each** (inline `fetch_cheapest` + routes-read) — they need no layer either.
+- **Over the 4096-char inline cap** (a big handler, or any layer zip) → land the zip in S3 via the **`flight-seed` base64 bridge** (Method 2 above), then deploy `Code:{S3Bucket,S3Key}`. The reason here is the **size cap** (and the checklist's S3-artifact check), not file count.
+- **The `stripe`+`requests` layer** is an **M2** need, not M1.2. Seed `layer.zip` to S3 the same way, then `publish-layer-version --content S3Bucket=…,S3Key=…`.
 
 ---
 
@@ -175,8 +204,12 @@ Test with `stripe listen --forward-to <api>/stripe-webhook` + `stripe trigger ch
 Everything surfaces in **CloudWatch Logs**, one group per function:
 
 ```bash
+# CLI mode:
 aws logs tail /aws/lambda/flight-parser --since 15m --follow --region us-east-1
 aws logs tail /aws/lambda/flight-fare-notification --since 15m --region us-east-1
+# Cowork (the MCP rejects `logs tail`) — use filter-log-events:
+aws logs filter-log-events --log-group-name /aws/lambda/flight-parser \
+  --query "events[].message" --region us-east-1
 ```
 
 Trace the path by following the data, not a process:

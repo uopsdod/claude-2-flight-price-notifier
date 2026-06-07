@@ -43,6 +43,25 @@ M1.2 builds the **EventBridge → Parser Wrapper → Parser** pipeline (teal) th
 
 This runs mainly in **Cowork** — paste the checks to the agent with the **AWS API MCP** (it runs each `aws` call). On the local CLI, run them directly. Every `aws` command uses `--region us-east-1` and the `[default]` profile (**no `--profile`**). Note: through the MCP, `--query` must **not** use JMESPath backtick literals (they fail to parse) — the queries below avoid them.
 
+## Connector-capability probe (do this first — the deploy path branches on it)
+
+M1.2 is the first milestone that ships a Lambda **zip**, and *how you get that zip into S3* depends on what your Cowork AWS connector can do. Find out now, not mid-build:
+
+ask """
+>
+Two quick questions about your environment so I pick the right deploy path:
+>
+1. Can you author a file and run shell tools like `zip` in a working directory you control, or can you ONLY run `aws ...` commands?
+>
+2. Try `aws logs tail --help` — does it work, or is `tail` rejected as an unknown operation?
+>
+"""
+
+- **`aws`-only connector (the common case — `logs tail` rejected, no file authoring):** you'll use the **`flight-seed` base64→S3 bridge** (main skill Step 3). The **bash sandbox builds the zip** (needs `zip`), the bridge moves it to S3.
+- **Connector with a writable shell workdir (rare):** you *may* `zip` + `aws s3 cp` directly — but the bridge works in both, so when unsure, use it.
+
+This one check is the difference between a smooth Step 3 and discovering the wall mid-deploy. (See [[aws-best-practice]] *Cowork execution constraints* → Method 2.)
+
 ## Verify (all must pass — fix via the noted M1.1 step if any fail)
 
 Paste to the Cowork agent (or run each `aws` line yourself in CLI mode):
@@ -75,7 +94,7 @@ https://api.travelpayouts.com/v1/prices/cheap?origin=TPE&destination=TYO&depart_
 
 > *(CLI: `curl -s "https://api.travelpayouts.com/v1/prices/cheap?origin=TPE&destination=TYO&depart_date=2026-07&currency=usd&token=<token>" | head -c 200` → expect `"success":true`.)*
 
-**Build tools** (CLI mode only — in Cowork the MCP builds the zip in its own workdir, so you don't need local `zip`): `python3 --version && which zip`.
+**Build tools** — M1.2 ships a Lambda zip, and **Cowork builds it in the bash sandbox** (the `aws`-only connector can't `zip`), then moves it to S3 via the `flight-seed` bridge. So you **do** need `zip` available in the sandbox: `python3 --version && which zip`. (Only a connector that exposes its own writable shell workdir could skip the sandbox — see the capability probe above.)
 
 - If (1) fails → redo `m1-1-subscribe-to-a-plan-prerequisites` Step 1.
 - If (2)/(3)/(4) fail → redo M1.1 Steps 1–3.
