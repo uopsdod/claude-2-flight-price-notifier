@@ -94,6 +94,8 @@ https://api.travelpayouts.com/v1/prices/cheap?origin=TPE&destination=TYO&depart_
 
 > *(CLI: `curl -s "https://api.travelpayouts.com/v1/prices/cheap?origin=TPE&destination=TYO&depart_date=2026-07&currency=usd&token=<token>" | head -c 200` → expect `"success":true`.)*
 
+> **One token, both currencies.** M1.2's parser fetches each route in **`twd`** (the gate) **and** **`usd`** (the email's supplementary line) — the **same `flight/travelpayouts` token serves both**; no new secret. (You can sanity-check by swapping `currency=twd`/`usd` in the URL above.)
+
 **Build tools** — M1.2 ships a Lambda zip, and **Cowork builds it in the bash sandbox** (the `aws`-only connector can't `zip`), then moves it to S3 via the `flight-seed` bridge. So you **do** need `zip` available in the sandbox: `python3 --version && which zip`. (Only a connector that exposes its own writable shell workdir could skip the sandbox — see the capability probe above.)
 
 - If (1) fails → redo `m1-1-subscribe-to-a-plan-prerequisites` Step 1.

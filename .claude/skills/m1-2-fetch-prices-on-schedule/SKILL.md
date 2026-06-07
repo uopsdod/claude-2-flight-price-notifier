@@ -143,35 +143,85 @@ Each function is **one self-contained `index.py`** (entry function `handler` →
 **`index.py` for `flight-parser`** (one route per invocation):
 1. Read `flight/travelpayouts` from Secrets Manager (cold start) → get the `token`.
 2. From the event, get `{origin, destination, route}`. Compute **next month** `YYYY-MM`.
-3. Call Travelpayouts and parse the cheapest fare (inline `fetch_cheapest`, below). **Empty/`429` → log + return** (skip this route this run; never crash).
+3. Fetch the cheapest fare **in TWD (the gating currency)**, then **best-effort in USD** for the email's supplementary line (inline `fetch_cheapest`, below). **TWD empty/`429` → log + return** (skip this route this run). **USD empty/`429` → just omit it** — never let the USD call block or crash the alert.
 4. **`Scan subscriptions`** with `FilterExpression route = :r` (boto3). **M1: no status filter** — match every subscriber. *(M2 adds `AND subscription_status = :active`.)*
-5. For each subscriber where `target_price >= cheapest["price"]`: `SendMessage` to `flight-fare-queue` with `{email, route, plan_name, target_price, cheapest:{price,currency,airline,depart_date,return_date}}`. (M1.2 logs the match; M1.3's consumer dedups + sends.)
+5. For each subscriber where **`Decimal(target_price) >= Decimal(cheapest_twd["price"])`** (the gate is **TWD vs the TWD target**): `SendMessage` to `flight-fare-queue` with the **dual-currency body** — `cheapest` (TWD, always) + `cheapest_usd` (USD, only if the USD call succeeded). (M1.2 logs the match; M1.3's consumer dedups + sends.)
 
-**Inline `fetch_cheapest` (stdlib only — `urllib`, no `requests`, no layer).** Hit `/v1/prices/cheap` and parse the **real response shape** — the result is `data[<DEST>][<index>]` objects whose keys are **`departure_at` / `return_at`** (ISO datetimes — **not** `depart_date`/`return_date`), plus `price` and `airline`. Parsing the wrong keys yields empty fares:
+**Inline `fetch_cheapest` (stdlib only — `urllib`, no `requests`, no layer).** Hit `/v1/prices/cheap` and parse the **real response shape** — the result is `data[<DEST>][<index>]` objects whose keys are **`departure_at` / `return_at`** (ISO datetimes — **not** `depart_date`/`return_date`), plus `price` and `airline`. Parsing the wrong keys yields empty fares. **Set a `User-Agent`** — some hosts behind Cloudflare reject the default `Python-urllib/3.x` UA with a `403`:
 ```python
 import os, json, urllib.request, urllib.parse
-def fetch_cheapest(origin, destination, month, token, currency="twd"):
+UA = "Mozilla/5.0 (compatible; flight-notifier/1.0)"
+def fetch_cheapest(origin, destination, month, token, currency):
     q = urllib.parse.urlencode({"origin": origin, "destination": destination,
         "depart_date": month, "currency": currency, "token": token})
-    url = f"https://api.travelpayouts.com/v1/prices/cheap?{q}"
-    with urllib.request.urlopen(url, timeout=10) as r:
+    req = urllib.request.Request(
+        f"https://api.travelpayouts.com/v1/prices/cheap?{q}",
+        headers={"User-Agent": UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
         body = json.loads(r.read())
     if not body.get("success") or not body.get("data"):
-        return None                                  # empty/cached → skip this route
+        return None                                  # empty/cached/429 → caller decides
     offers = body["data"].get(destination, {})
     if not offers:
         return None
     best = min(offers.values(), key=lambda o: o["price"])   # cheapest of the bucket
-    return {"price": best["price"], "currency": currency.upper(),
+    return {"price": best["price"], "currency": currency.upper(),  # uppercase in the message
             "airline": best.get("airline"),
             "depart_date": best.get("departure_at"),  # note the API's key name
             "return_date": best.get("return_at")}
 ```
-(For M1.3's email headline you'll also want a `currency="usd"` call — same parse. Keep both inline.)
+
+**Call it twice — gate on TWD, USD is best-effort:**
+```python
+tw = fetch_cheapest(origin, destination, month, token, "twd")   # API param is lowercase
+if not tw:
+    print("no TWD fare for", route, "this run (empty/429) - skipping"); return {"ok": True, "route": route, "matched": 0}
+us = fetch_cheapest(origin, destination, month, token, "usd")   # may be None — do NOT block on it
+# then per matching subscriber:
+body = {"email": it["email"], "route": route, "plan_name": it.get("plan_name"),
+        "target_price": int(tp),
+        "cheapest": {"price": tw["price"], "currency": "TWD", "airline": tw["airline"],
+                     "depart_date": tw["depart_date"], "return_date": tw["return_date"]}}
+if us:
+    body["cheapest_usd"] = {"price": us["price"], "currency": "USD", "airline": us["airline"],
+                            "depart_date": us["depart_date"], "return_date": us["return_date"]}
+_sqs.send_message(QueueUrl=QURL, MessageBody=json.dumps(body))
+```
 
 **`index.py` for `flight-parser-wrapper`** (EventBridge target) — also one self-contained file (it inlines the S3 routes read):
 1. Read `flight-routes.json` from S3: `boto3.client("s3").get_object(Bucket=os.environ["CONFIG_BUCKET"], Key="flight-routes.json")` → `json.loads(...)` → `[{plan,origin,destination}, …]`.
 2. For each route, `boto3.client("lambda").invoke(FunctionName="flight-parser", InvocationType="Event", Payload=json.dumps({"origin":…, "destination":…, "route":f"{origin}-{destination}"}))` (async fan-out — one slow/empty route can't block the others).
+
+### Message schema (enqueued to `flight-fare-queue`)
+
+This is the contract M1.3 consumes. **`cheapest` (TWD) is always present** — it's the gate and the email's headline price. **`cheapest_usd` (USD) is optional** — present only when the USD fetch succeeded; it drives the supplementary 「約 US$…」 line in M1.3 (omit the line if absent).
+
+```json
+{
+  "email": "you@example.com",
+  "route": "TPE-TYO",
+  "plan_name": "tokyo",
+  "target_price": 12000,                 // TWD — the gate + the subject line
+  "cheapest": {                          // TWD — gate + HEADLINE price (ALWAYS present)
+    "price": 9325, "currency": "TWD", "airline": "LJ",
+    "depart_date": "2026-07-12T01:25:00+08:00",
+    "return_date": "2026-07-23T22:40:00+09:00"
+  },
+  "cheapest_usd": {                      // USD — supplementary "約 US$" line (OPTIONAL — omitted if the USD call failed/empty)
+    "price": 298, "currency": "USD", "airline": "LJ",
+    "depart_date": "2026-07-12T01:25:00+08:00",
+    "return_date": "2026-07-23T22:40:00+09:00"
+  }
+}
+```
+
+**Currency roles:** **TWD is primary** — the gate (`target_price` is TWD), the subject, and the headline. **USD is supplementary** — a small 「約 US$…」 line only. The schema is **additive/backward-compatible**: a consumer that reads only `cheapest` (TWD) and ignores unknown fields keeps working; M1.3 opts in to `cheapest_usd`.
+
+**Caveats:**
+- **Two Travelpayouts calls per route per run** — doubles API usage + `429` exposure. On a USD `429`/empty, **still send with TWD only** (`cheapest_usd` omitted). The USD call must never block or crash the alert.
+- **The two responses are independent** — the cheapest USD entry and cheapest TWD entry may be **different flights** (airline/dates), and the USD price is **not an exact FX** of the TWD price. For the course this is fine — the email labels it 「約」. (If you ever need the same flight in both, match the chosen TWD flight by `airline`+dates in the USD response, or apply a static FX — document whichever.)
+- **Casing:** the API param is lowercase (`twd`/`usd`); the message records uppercase (`"TWD"`/`"USD"`).
+- **No new secret** — the same `flight/travelpayouts` token serves both currencies.
 
 ### Step 3 — Deploy both Lambdas via the `flight-seed` S3 bridge
 
