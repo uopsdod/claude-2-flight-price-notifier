@@ -9,6 +9,32 @@ description: Prerequisites before M1.2 of the Flight Price Notifier course — c
 
 M1.2 adds **no new accounts** — it reuses M1.1's AWS access (`[default]` profile), the `flight-lambda-role`, the `flight/travelpayouts` secret, and the DynamoDB `subscriptions` + `notification_history` tables. M1.2 *creates* the S3 routes config + the fare SQS queue and *extends* the role with S3/SQS/InvokeFunction perms — this skill just confirms the M1.1 carryover is in place and the Travelpayouts token still works.
 
+## Flow structure (where M1.2 sits)
+
+M1.2 builds the **EventBridge → Parser Wrapper → Parser** pipeline (teal) that reads **Flight Routes [S3]** (orange, admin-edited), fetches fares from **Travelpayouts** (grey), and scans the **Subscriptions [DynamoDB]** table M1.1 filled (pink) — enqueueing matches for M1.3. This prereq confirms the M1.1 carryover (role, secret, tables) that pipeline depends on.
+
+```
+ ┌──── Flight Fare Checker ──────────────────────────────────────────────────┐
+ │                   ┌────────────────────────┐    1. subscriber             │
+ │                   │  Subscriptions         │    2. target price           │
+ │                   │  [DynamoDB] (M1.1)     │◀───(Scan per route)──┐        │
+ │                   └────────────────────────┘                     │        │
+ │   ┌──────────┐     ┌────────────────┐         ┌──────────────────┴──┐     │
+ │   │  Event   │────▶│  Parser        │────────▶│  Parser  (×N routes) │     │
+ │   │  Bridge  │ 30m │  Wrapper  λ    │ invoke  │          λ  λ  λ      │     │
+ │   └──────────┘     └───────┬────────┘  /route └─────────┬───────────┘     │
+ │              admin ✈ ──▶   ▼ (read routes)              ▲ fetch cheapest   │
+ │                   ┌────────────────┐         ┌──────────┴───────────┐     │
+ │                   │ Flight Routes  │         │ 3rd-party Parser API │     │
+ │                   │ [S3]           │         │ [travelpayouts] 🐞   │     │
+ │                   └────────────────┘         └──────────────────────┘     │
+ │   each match → SQS flight-fare-queue ─▶ M1.3 (dedup + email)              │
+ └────────────────────────────────────────────────────────────────────────────┘
+
+ Legend:  ▮ orange = manual input (admin)   ▮ teal = main component (λ)
+          ▮ pink = user data (DynamoDB)     ▮ grey = 3rd-party / shared Lambda
+```
+
 ## When to load this skill
 
 - "M1.2 環境準備" / any time M1.2 detects a missing role/secret/token.

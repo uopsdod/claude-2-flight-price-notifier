@@ -7,7 +7,25 @@ description: Flight Price Notifier Milestone 1.2 verification — confirms the p
 
 ## What this skill does
 
-Confirms M1.2 really works: routes load from S3, the parser fetches real fares + matches subscribers + enqueues to SQS, and EventBridge triggers the wrapper. Emits `READY for M1.3`. Run after `m1-2-fetch-prices-on-schedule` Step 4.
+Confirms M1.2 really works: routes load from S3, the parser fetches real fares + matches subscribers + enqueues to SQS, and EventBridge triggers the wrapper. Emits `READY for M1.3`. Run after `m1-2-fetch-prices-on-schedule` Step 5 (EventBridge wired).
+
+## Flow being verified
+
+```
+ ┌──── Flight Fare Checker ──────────────────────────────────────────────────┐
+ │   ┌──────────┐     ┌────────────────┐         ┌─────────────────────┐     │
+ │   │  Event   │────▶│  Parser Wrapper│────────▶│  Parser  (×N routes)│     │  D = schedule
+ │   │  Bridge  │ 30m │  λ             │ invoke  │          λ  λ  λ     │     │  B = Lambdas run
+ │   └──────────┘     └───────┬────────┘  /route └────┬──────────┬─────┘     │
+ │              admin ✈ ──▶   ▼ read routes           │ scan     ▲ fetch     │
+ │              ┌────────────────┐  ┌────────────────┐│cheapest  │           │
+ │              │ Flight Routes  │  │ Subscriptions  │◀┘  ┌───────┴────────┐  │  A = config+queue
+ │              │ [S3]      (A)  │  │ [DynamoDB](C)  │    │ travelpayouts  │  │  C = match+enqueue
+ │              └────────────────┘  └────────────────┘    └────────────────┘  │
+ │   match → SQS flight-fare-queue (A2/C1) ─▶ M1.3                            │
+ └────────────────────────────────────────────────────────────────────────────┘
+```
+(Letters map to the check sections below: **A** config+queue+zip, **B** Lambdas run, **C** match→enqueue, **D** schedule wired.)
 
 ## Execution mode
 

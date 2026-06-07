@@ -36,6 +36,43 @@ This course runs mainly in **Cowork** — you talk to a Cowork agent with the **
 
 ## Architecture
 
+M1.2 **explodes the Flight Fare Checker box** — the parser side of the Subscriptions table M1.1 filled. EventBridge drives `Parser Wrapper`, which reads **Flight Routes [S3]** (admin-edited) and fans out one `Parser` per route; each Parser fetches the cheapest fare from **Travelpayouts** and scans **Subscriptions [DynamoDB]** to find whose target is met, enqueuing matches for M1.3.
+
+```
+                       ┌────────────────────┐
+                       │   Product Site     │   ← Vercel host (writes subs in M1.1)
+                       │   [Vercel host] ▲  │
+                       └─────────┬──────────┘
+                                 │ POST /subscribe (M1.1)
+ ┌──── Flight Fare Checker ──────┼───────────────────────────────────────────┐
+ │                               ▼                                            │
+ │                   ┌────────────────────────┐    1. subscriber             │
+ │                   │  Subscriptions         │    2. target price           │
+ │                   │  [DynamoDB]            │◀───(Scan per route)──┐        │
+ │                   └────────────────────────┘                     │        │
+ │   ┌──────────┐     ┌────────────────┐         ┌──────────────────┴──┐     │
+ │   │  Event   │────▶│  Parser        │────────▶│  Parser  (×N routes) │     │
+ │   │  Bridge  │ 30m │  Wrapper  λ    │ invoke  │          λ  λ  λ      │     │
+ │   └──────────┘     └───────┬────────┘  /route └─────────┬───────────┘     │
+ │                            │ 1.from 2.to                ▲ from / to        │
+ │              admin ✈ ──▶   ▼ (read routes)              │ fetch cheapest   │
+ │                   ┌────────────────┐         ┌──────────┴───────────┐     │
+ │                   │ Flight Routes  │         │ 3rd-party Parser API │     │
+ │                   │ [S3]           │         │ [travelpayouts] 🐞   │     │
+ │                   └────────────────┘         └──────────────────────┘     │
+ │                                                                            │
+ │   each match → SQS flight-fare-queue {1.from 2.to 3.subscriber            │
+ │                                       4.target price 5.flight link} ─▶ M1.3│
+ └────────────────────────────────────────────────────────────────────────────┘
+
+ Legend:  ▮ orange = manual input (admin edits Flight Routes [S3])
+          ▮ teal   = main component (Parser Wrapper / Parser λ)
+          ▮ pink   = user data (Subscriptions [DynamoDB])
+          ▮ grey   = 3rd-party (Travelpayouts) / shared Lambda + Library Layer
+```
+
+**Operational sequence (what each Lambda does):**
+
 ```
 [EventBridge rate(30 min)] ─▶ [flight-parser-wrapper λ]
                                  · 從 S3 讀 flight-routes.json（兩條：TPE-TYO, TPE-SEL）
