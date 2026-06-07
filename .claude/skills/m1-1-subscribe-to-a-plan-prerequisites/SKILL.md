@@ -1,6 +1,6 @@
 ---
 name: m1-1-subscribe-to-a-plan-prerequisites
-description: One-time setup before M1.1 of the Flight Price Notifier course — clone the M0 GitHub repo (into a native dir), AWS access (the `[default]` profile via an admin IAM user), and a Travelpayouts token (token only — the affiliate marker is deferred to M1.3 where it's used). Cowork-first; notes the inline-CFN deploy method. Use when the student starts M1.1 for the first time, or when `m1-1-subscribe-to-a-plan` / `-checklist` detects the project, AWS access, or the Travelpayouts token is missing.
+description: One-time setup before M1.1 of the Flight Price Notifier course — clone the M0 GitHub repo (into a native dir), AWS access (the `[default]` profile via an admin IAM user), and a Travelpayouts token (token only — the notifier never needs the affiliate marker). Cowork-first; notes the inline-CFN deploy method. Use when the student starts M1.1 for the first time, or when `m1-1-subscribe-to-a-plan` / `-checklist` detects the project, AWS access, or the Travelpayouts token is missing.
 ---
 
 # M1.1 Prerequisites — AWS + Travelpayouts
@@ -131,13 +131,13 @@ This is the tool Cowork uses to run every `aws` call in the course (it reads you
 
 ## Step 2 — Travelpayouts token
 
-M1.1 (and the fetch API) only need the **token** — collect just that now.
+The whole course needs only the **token** — the fetch API authenticates on it alone.
 
 1. Sign up free at https://www.travelpayouts.com/ and connect the **Aviasales** program.
 2. Dashboard → **Profile → API token** → copy the **token**. (https://app.travelpayouts.com/profile/api-token)
 3. (You'll store it as `{"token":…}` in the `flight/travelpayouts` secret during M1.1 Step 2.)
 
-> **Not the marker yet.** The Travelpayouts **marker** (affiliate ID, e.g. `736582`) is only used for **booking-link attribution in the M1.3 alert email** — the fetch API authenticates on the token alone (the token-check URL below returns `"success":true` with no marker). You probably don't have the marker handy now, and forcing it here just means storing a placeholder. **M1.3's prereq collects the marker** and updates this secret when it's actually consumed.
+> **No marker needed.** Travelpayouts also gives you a **marker** (affiliate ID, e.g. `736582`), but the notifier never requires it — fetching fares and deciding whom to email both authenticate on the token alone. The marker only matters if you later want the booking link in the alert email to earn you commission; that's an *optional* add-on covered as a skippable aside in M1.3 (`m1-3-email-on-target` → "Optional: monetize the booking link"). Don't collect it now.
 
 **Verify the token works** — the API accepts the token as a `token=` query param, so it's checkable without a shell:
 

@@ -121,7 +121,7 @@ aws secretsmanager create-secret --name flight/travelpayouts \
   --secret-string '{"token":"REPLACE"}' \
   --region us-east-1
 ```
-(Just the **token** here — it's all M1.1/M1.2 need. The Travelpayouts **marker** (affiliate ID for booking-link attribution) is added to this secret in **M1.3**, when the alert email's `booking_url(marker)` first uses it. DynamoDB needs no secret — the Lambda uses its IAM role.)
+(Just the **token** — it's all the whole course needs; the Travelpayouts fetch API authenticates on the token alone. There's no `marker`: the notifier doesn't require an affiliate ID. DynamoDB needs no secret — the Lambda uses its IAM role.)
 
 **Verify before moving on:** `aws secretsmanager list-secrets --region us-east-1 --query 'SecretList[].Name'` lists `flight/travelpayouts`.
 
