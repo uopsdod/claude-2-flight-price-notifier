@@ -9,6 +9,22 @@ description: Flight Price Notifier Milestone 1.3 verification — confirms the f
 
 Confirms M1.3 really works: the fare-SQS consumer sends a real email, dedups via `notification_history`, re-alerts only on a meaningfully cheaper fare, and emails **without** any payment guard. Emits `READY for M2`. Run after `m1-3-email-on-target` Step 3.
 
+## Flow being verified (the Notification box)
+
+```
+ (M1.2) ┌─────┐    ┌──── Notification ───────────────────────────────┐
+  ─────▶│ SQS │───▶│  ┌────────────────────────┐   ┌───────────────┐ │
+        └─────┘    │  │ Flight Fare            │──▶│ Notification  │ │  A = secret + wired
+        (A)        │  │ Notification λ  (A,B)  │◀──│ History [DDB] │ │  B = email fires (Resend)
+                   │  └───────────┬────────────┘   └───────────────┘ │  C = dedup blocks repeat
+                   └──────────────┼───────(C,D)─────────────────────┘  D = re-alert + negative
+                                  ▼
+                          ┌────────────────┐
+                          │ Email [Resend] │  ◀ B = the alert lands in a real inbox
+                          └────────────────┘
+```
+(Letters map to the check sections below: **A** Resend+consumer wired, **B** email fires, **C** dedup, **D** re-alert/negative.)
+
 ## How to run
 
 Run each check and report. You'll seed a test match (a subscriber whose `target_price` is above the live fare) so the parser enqueues it; use a real inbox you can check. All `aws` commands `--region us-east-1`.
@@ -34,9 +50,11 @@ Run each check and report. You'll seed a test match (a subscriber whose `target_
 - **B1** Seed a test subscriber with `target_price` ABOVE the live fare (e.g. TPE→TYO target NT$12,000 vs live ~NT$9,531) — **and no `subscription_status`** (M1 has none). Run the parser so it enqueues, then watch the consumer:
   ```bash
   aws lambda invoke --function-name flight-parser \
-    --payload '{"origin":"TPE","destination":"TYO","route":"TPE-TYO"}' /tmp/p.json \
+    --payload '{"origin":"TPE","destination":"TYO","route":"TPE-TYO"}' out.json \
     --region us-east-1
-  aws logs tail /aws/lambda/flight-fare-notification --since 5m --region us-east-1 | grep -iE "resend|sent|email|skip"
+  # read the consumer's logs (the MCP rejects `logs tail` — use filter-log-events):
+  aws logs filter-log-events --log-group-name /aws/lambda/flight-fare-notification \
+    --query "events[].message" --region us-east-1
   ```
 - **B2** **The decisive test:** the inbox receives the alert (subject 「✈️ 台北 → 東京 降價通知！NT$9,531 已達標」). Confirm the card shows the USD headline + 約 NT$, the user's target, and the 「立即訂購」 button.
 - **B3** **No payment guard:** the subscriber was emailed despite having **no `subscription_status`** — confirms M1 emails anyone eligible (the guard is M2).

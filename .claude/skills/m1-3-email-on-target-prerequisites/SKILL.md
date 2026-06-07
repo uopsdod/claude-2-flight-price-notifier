@@ -9,6 +9,27 @@ description: Prerequisites before M1.3 of the Flight Price Notifier course — a
 
 M1.3 adds one account: **Resend** (transactional email). Everything else carries over from M1.2 (the `flight-parser`/`flight-parser-wrapper` Lambdas, the **`flight-fare-queue`** SQS that they enqueue matches to, the AWS role, and the **`notification_history`** DynamoDB table used for dedup). This skill gets Resend ready and confirms that carryover.
 
+## Flow structure (where M1.3 sits)
+
+M1.3 builds the **Notification box** — the consumer that drains the **SQS** queue M1.2 fills, dedups against **Notification History [DynamoDB]**, and sends **Email [Resend]**. This prereq gets **Resend** ready and confirms the M1.2 carryover (the queue + the history table) that box depends on.
+
+```
+  (M1.2 fills) ┌─────┐     ┌──── Notification (M1.3 builds this) ──────────┐
+   ───────────▶│ SQS │────▶│  ┌─────────────────────────┐                  │
+               └─────┘     │  │ Flight Fare Notification│   Notification   │
+                           │  │   λ   · 24h floor /      │◀─ History        │
+                           │  │       ≥20% / ≥NT$2000    │   [DynamoDB]     │
+                           │  │   · email_render →Resend │   (dedup)        │
+                           │  └────────────┬────────────┘                  │
+                           └───────────────┼────────────────────────────────┘
+                                           ▼
+                                   ┌────────────────┐
+                                   │ Email [Resend] │  ◀ this prereq sets up the Resend account/key
+                                   └────────────────┘
+
+ Legend:  ▮ teal = main component (λ)   ▮ pink = user data (Notification History [DynamoDB])   ▮ grey = SQS
+```
+
 ## When to load this skill
 
 - "M1.3 環境準備" / any time M1.3 detects Resend is missing.

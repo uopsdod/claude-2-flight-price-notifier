@@ -37,6 +37,32 @@ Requires M1.2 done (`m1-2-fetch-prices-on-schedule-checklist` green — the pars
 
 ## Architecture
 
+M1.3 **builds the Notification box** (right) — the consumer side of the **SQS** queue M1.2 fills. The `flight-fare-notification` Lambda drains the queue, dedups against **Notification History [DynamoDB]**, and sends via **Email [Resend]**. Everything left of the SQS is M1.1+M1.2 (shown for context).
+
+```
+ ┌──── Flight Fare Checker (M1.1 + M1.2) ───────────┐         ┌──── Notification (M1.3) ─────────────────┐
+ │  ┌──────────┐  ┌─────────┐   ┌──────────────┐    │         │           ┌────────────────────────┐      │
+ │  │  Event   │─▶│ Parser  │──▶│ Parser (×N)  │    │ ┌─────┐ │           │ Notification History   │      │
+ │  │  Bridge  │  │ Wrapper │   │   λ  λ  λ     │───────▶│ SQS │─┼──┐        │ [DynamoDB]  (dedup)    │      │
+ │  └──────────┘  └────┬────┘   └──────┬───────┘    │ └─────┘ │  │        └───────────┬────────────┘      │
+ │      admin ✈ ─▶ Flight Routes [S3]  ▲ Travelpayouts│        │  ▼  query newest ──▲──┘ PutItem(sent_at)  │
+ │                  Subscriptions [DynamoDB] (M1.1)  │         │ ┌──────────────────┴───────────────────┐ │
+ │                  ▲ scan (subscriber, target price)│         │ │  Flight Fare Notification  λ          │ │
+ └───────────────────────────────────────────────────┘        │ │   · 24h floor? or ≥20% / ≥NT$2000?     │ │
+   message → {1.from 2.to 3.subscriber 4.target price 5.flight link} │   · email_render → POST Resend         │ │
+                                                                │ └──────────────────┬───────────────────┘ │
+                                                                └────────────────────┼─────────────────────┘
+                                                                                     ▼
+                                                                            ┌────────────────┐
+                                                                            │ Email [Resend] │  ◀ alert lands
+                                                                            └────────────────┘
+
+ Legend:  ▮ orange = manual input (Flight Routes [S3])   ▮ teal = main component (λ)
+          ▮ pink = user data (Subscriptions / Notification History [DynamoDB])   ▮ grey = SQS / 3rd-party / shared Lambda
+```
+
+**Operational sequence (the consumer):**
+
 ```
 [SQS flight-fare-queue]（M1.2 丟進來的達標訂閱者）
    ─event-source mapping─▶ [flight-fare-notification Lambda]
@@ -94,9 +120,10 @@ aws lambda update-function-configuration --function-name flight-fare-notificatio
 ```
 Also set the queue's **`VisibilityTimeout` ≥ this Lambda's timeout** (see [[aws-best-practice]] Rule 5) so a slow send isn't re-delivered mid-flight.
 
-**Verify before moving on:** with a seeded match on the queue (re-run the M1.2 parser if needed), the consumer sends one email:
+**Verify before moving on:** with a seeded match on the queue (re-run the M1.2 parser if needed), the consumer sends one email (read its logs with `filter-log-events` — the MCP rejects `logs tail`):
 ```bash
-aws logs tail /aws/lambda/flight-fare-notification --since 5m --region us-east-1
+aws logs filter-log-events --log-group-name /aws/lambda/flight-fare-notification \
+  --query "events[].message" --region us-east-1
 ```
 Inbox receives the alert (subject 「✈️ 台北 → 東京 降價通知！NT$9,531 已達標」, USD headline + 約 NT$, 「立即訂購」 button).
 
