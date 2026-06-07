@@ -48,23 +48,25 @@ This course runs mainly in **Cowork** — you paste the **`ask """ … """`** bl
 
 **Verify** the key works by actually sending a test email. **Why this isn't a `curl` in Cowork:** the Cowork sandbox **can't reach `api.resend.com`** — the network proxy blocks it (`403` on `CONNECT`), and the agent's web-fetch tool is **GET-only**, so a POST to Resend can't run there. The one place in your stack that *does* have outbound internet is a **Lambda** — which is exactly where the real alert email will be sent from. So we verify from there. (Same two-host reality as the AWS deploy — see [[aws-best-practice]] *Cowork execution constraints*, and [[resend-best-practice]] Rule 0.)
 
-**1. Store the key as the `flight/resend` secret** (check-then-collect — if a previous session already stored it, skip). Paste to the Cowork agent — swap in your key and your **Resend-account email**:
+**1. Store the key as the `flight/resend` secret** (check-then-collect — if a previous session already stored it, skip). Paste to the Cowork agent (fill the two values in **once** at the top):
 
 ask """
 >
-Store the Resend secret in Secrets Manager, us-east-1 — check first, then create or update:
+My Resend API key (fill this in): re_<REPLACE_WITH_YOUR_KEY>
+>
+My Resend-account email (fill this in — the email I signed up to Resend with): <REPLACE_WITH_YOUR_RESEND_ACCOUNT_EMAIL>
+>
+Store the Resend secret in Secrets Manager as `flight/resend` (shape: `{"api_key":"<the key above>","from":"onboarding@resend.dev","test_to":"<the email above>"}`). Region us-east-1. Check first, then create or update:
 >
 ```bash
 aws secretsmanager describe-secret --secret-id flight/resend --region us-east-1 --query "Name"
 ```
 >
-If that returns `flight/resend`, it already exists — skip. If ResourceNotFoundException, create it:
+- If that returns `flight/resend`, it already exists — skip.
 >
-```bash
-aws secretsmanager create-secret --name flight/resend --secret-string '{"api_key":"re_REPLACE","from":"onboarding@resend.dev","test_to":"YOUR_RESEND_ACCOUNT_EMAIL"}' --region us-east-1
-```
+- If ResourceNotFoundException → `aws secretsmanager create-secret --name flight/resend --secret-string '{"api_key":"<the key above>","from":"onboarding@resend.dev","test_to":"<the email above>"}' --region us-east-1`
 >
-(`test_to` is only used by the throwaway test below; M1.3 reads `api_key` + `from`.)
+(`from` stays `onboarding@resend.dev` until M3; `test_to` is only used by the throwaway test below; M1.3 reads `api_key` + `from`.)
 >
 """
 
