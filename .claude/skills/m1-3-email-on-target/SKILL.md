@@ -49,24 +49,17 @@ Requires M1.2 done (`m1-2-fetch-prices-on-schedule-checklist` green — the pars
 
 ## Conversational flow
 
-### Step 1 — Set up Resend + store the secret
+### Step 1 — Confirm the Resend secret (created in the prereq)
 
-1. Sign up at https://resend.com/, create an **API key**.
-2. For instant testing, send **from `onboarding@resend.dev`** (zero setup; verifying your own domain is M3).
-3. Store it:
-```bash
-aws secretsmanager create-secret --name flight/resend \
-  --secret-string '{"api_key":"re_REPLACE","from":"onboarding@resend.dev"}' \
-  --region us-east-1
-```
+The **`flight/resend`** secret was created **and the key verified** in `m1-3-email-on-target-prerequisites` (Step 1 — it stored `{"api_key","from"}` and proved a real send via the throwaway `flight-resend-test` Lambda, since the Cowork sandbox can't POST to `api.resend.com` directly). So there's nothing to create here — just confirm it's present. Paste to the agent:
 
-**Verify before moving on:** a one-off Resend test send works:
-```bash
-curl -s -X POST https://api.resend.com/emails -H "Authorization: Bearer re_REPLACE" \
-  -H "Content-Type: application/json" \
-  -d '{"from":"onboarding@resend.dev","to":"you@example.com","subject":"test","html":"hi"}'
-```
-Expect a JSON `id`. Check your inbox.
+ask """
+>
+Confirm the Resend secret exists (don't print the value): `aws secretsmanager describe-secret --secret-id flight/resend --region us-east-1 --query "Name"` — expect `flight/resend`.
+>
+"""
+
+If it's missing → go back and run the M1.3 prereq Step 1. (Sending stays from `onboarding@resend.dev` until M3 verifies your own domain.)
 
 ### Step 2 — Write the fare-notification Lambda (consumer + dedup)
 
@@ -165,3 +158,4 @@ When `m1-3-email-on-target-checklist` is green: 「M1.3 完成！達標會真的
 - Reused renderer: `flightproxy/email_render.py`; booking link via `Fare.booking_url()` (no marker needed).
 - Dedup pattern modeled on the sibling bag-notification service's history-table + window approach.
 - [[aws-best-practice]] — SQS visibility timeout, Decimal, layer packaging.
+- [[resend-best-practice]] — the demo-sender-only-to-self trap, verified-`from` deliverability, dedup-before-send, html+text, no-VPC, rate limits.

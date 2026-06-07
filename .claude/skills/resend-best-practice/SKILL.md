@@ -23,7 +23,7 @@ Resend is a hosted REST API; the calling code (the Lambda) runs identically in b
 
 | Operation | CLI mode | Cowork mode |
 |---|---|---|
-| One-off test send | `curl -X POST https://api.resend.com/emails -H "Authorization: Bearer re_…" …`, or the `resend` CLI (`resend email send …`) | paste a fetch/POST ask-block to the agent, or **Resend dashboard → Emails → Send** |
+| One-off test send | `curl -X POST https://api.resend.com/emails -H "Authorization: Bearer re_…" …`, or the `resend` CLI | **NOT** a sandbox `curl`/web-fetch (POST is proxy-blocked — Rule 0). Send from a Lambda (`flight-resend-test`, invoked via the AWS MCP), or click **Resend dashboard → Emails → Send** |
 | Store the API key + `from` | into the **`flight/resend`** Secrets Manager secret | same — `aws secretsmanager create-secret` / `put-secret-value` |
 | Verify a sending domain (M3) | Resend dashboard → Domains (+ DNS at registrar) | identical (dashboard + registrar) |
 | Read delivery status | Resend dashboard → Emails (per-message log) | identical (dashboard) |
@@ -33,6 +33,19 @@ Resend is a hosted REST API; the calling code (the Lambda) runs identically in b
 ---
 
 ## Hard rules
+
+### Rule 0 — In Cowork you can't POST to `api.resend.com` from the sandbox — send only from a Lambda
+
+> **The rule:** The Cowork bash/build sandbox **cannot reach `api.resend.com`** — the network proxy blocks outbound HTTPS to it (`403` on `CONNECT`, allowlist), and the agent's web-fetch tool is **GET-only** (it can't do an authenticated POST with a body). So **never try to verify or send Resend mail by a `curl`/POST in Cowork.** The only thing in your stack with real outbound internet is a **Lambda** — do every Resend POST from there.
+
+**Why:** This is the same **two-host gap** that shapes the AWS deploy ([[aws-best-practice]] *Cowork execution constraints*): the sandbox has tools but no network to arbitrary hosts; the connectors (AWS MCP) have network but aren't a shell. A GET check (like the Travelpayouts token URL) sneaks through the agent's web-fetch — but Resend needs a **POST + `Authorization` header + body**, which web-fetch can't do and the sandbox can't route. Students hit a confusing `blocked-by-allowlist / 403 on CONNECT` and think their key is wrong; it isn't — the *path* is wrong.
+
+**How to apply:**
+- **Verify the key in the prereq** by deploying a tiny **`flight-resend-test`** Lambda (inline CFN, reads `flight/resend`, POSTs to Resend) and invoking it via the AWS MCP — the Lambda runs *inside AWS* and has internet. Read the result from its **logs** (`filter-log-events`) + your inbox, not the invoke output (the MCP can't read that file). See [[m1-3-email-on-target-prerequisites]] Step 1.
+- **The real alert** is sent the same way — from `flight-fare-notification`, a Lambda. That's why M1.3's design never sends from the browser or the sandbox.
+- **Zero-code alternative for a pure key check:** the **Resend dashboard → Emails → Send** button (no network needed from your side at all).
+
+---
 
 ### Rule 1 — `onboarding@resend.dev` only delivers to YOUR OWN Resend-account email — this trips the M1.3 test
 
