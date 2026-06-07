@@ -112,16 +112,21 @@ aws dynamodb describe-table --table-name subscriptions --region us-east-1 \
 ```
 Shows `ACTIVE` with HASH=email, RANGE=route.
 
-### Step 2 — Store the secrets the Lambda needs
+### Step 2 — Store the secret the Lambda needs (check-then-collect)
 
-*(No `flight/supabase` — Supabase is auth-only; the Lambda reaches DynamoDB via IAM, not a key.)*
+The parser reads the Travelpayouts **token** from `flight/travelpayouts`. **Check whether it already exists first** — a returning session almost always has it (you collected it in the M1.1 prereq), so don't re-create:
 
 ```bash
+# already stored? (skip create if it returns the name)
+aws secretsmanager describe-secret --secret-id flight/travelpayouts --region us-east-1 --query "Name"
+# only if ResourceNotFoundException:
 aws secretsmanager create-secret --name flight/travelpayouts \
   --secret-string '{"token":"REPLACE"}' \
   --region us-east-1
 ```
-(Just the **token** — it's all the whole course needs; the Travelpayouts fetch API authenticates on the token alone. There's no `marker`: the notifier doesn't require an affiliate ID. DynamoDB needs no secret — the Lambda uses its IAM role.)
+(Just the **token** — the fetch API authenticates on it alone; no `marker`. DynamoDB needs **no** secret — the Lambda reaches it via its IAM role.)
+
+> **`flight/supabase` exists too — but the Lambda never reads it.** It caches the front-end's `{url, anon_key}` (stored in M0) only so a new session can recall them; Supabase stays **auth-only for data** (the app data lives in DynamoDB, reached by IAM, not a key). See [[aws-best-practice]] Rule 2.
 
 **Verify before moving on:** `aws secretsmanager list-secrets --region us-east-1 --query 'SecretList[].Name'` lists `flight/travelpayouts`.
 

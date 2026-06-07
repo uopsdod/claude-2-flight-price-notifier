@@ -57,11 +57,11 @@ You (Claude Code) actively run each check and report. Ask the student for: the A
   Expect `ACTIVE`, HASH=pk, RANGE=sent_at.
 
 ### Section B — AWS plumbing
-- **B1** Secret present (no `flight/supabase`):
+- **B1** Secret present:
   ```bash
   aws secretsmanager list-secrets --region us-east-1 --query "SecretList[].Name"
   ```
-  Look for `flight/travelpayouts` in the list (others arrive in later milestones). **Don't** use a backtick JMESPath filter like `SecretList[?starts_with(Name,\`flight/\`)]` — it errors through the AWS API MCP ("Unknown token"); list all names and scan.
+  Look for `flight/travelpayouts` (and, after the M1.1 prereq, the convenience-cache secrets `flight/github` + `flight/supabase`; the Lambda-runtime keys `flight/resend`/`/stripe`/etc. arrive in later milestones). **Don't** use a backtick JMESPath filter like `SecretList[?starts_with(Name,\`flight/\`)]` — it errors through the AWS API MCP ("Unknown token"); list all names and scan.
 - **B2** Role has DynamoDB perms: `aws iam get-role-policy --role-name flight-lambda-role --policy-name flight-data --query 'PolicyDocument.Statement[].Action'`
 - **B3** Lambda exists: `aws lambda get-function --function-name flight-save-subscription --region us-east-1 --query 'Configuration.FunctionName'`
 

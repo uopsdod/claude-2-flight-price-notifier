@@ -68,7 +68,10 @@ Clone into a **native working directory** (your home dir), NOT the mounted works
 
 > The working copy is **ephemeral** — **GitHub + Vercel are the source of truth.** If the sandbox resets, just re-clone. (See [[aws-best-practice]] *Cowork execution constraints* #5.)
 
-**2. Get a GitHub Personal Access Token** so the agent can push back:
+**2. Get a GitHub Personal Access Token** so the agent can push back.
+
+> **Returning to the course?** If you already stored your PAT in `flight/github` on a previous run, you **don't need a new one** — once AWS is up (Step 1 below) the agent can recall it: paste *"Read my GitHub PAT from the `flight/github` secret and use it to push."* Skip to step 3. First time through, create one:
+
 - Go to https://github.com/settings/personal-access-tokens → **Generate new token (fine-grained)**.
 - **Repository access → Only select repositories** → pick this one repo.
 - **Permissions → Repository permissions → Contents → enable `Read and write`**.
@@ -89,6 +92,8 @@ Here is my GitHub Personal Access Token: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 """
 
 **Verify:** the live Vercel site shows the title **"Flight Price Notifier V3"** after the agent pushes and the deploy finishes. That proves: the repo is cloned, the token can push, and GitHub → Vercel auto-deploy is wired. (Change the title back to "Flight Price Notifier" when you're done testing.)
+
+> **Store it once, never paste it again.** As soon as AWS is set up (Step 1), save the PAT to Secrets Manager so every future session recalls it instead of asking you to re-paste — see Step 1c.
 
 > **Why this matters:** every later milestone edits this repo (the subscribe form in M1.1, etc.) and relies on `git push → Vercel redeploy`. If that loop is broken, nothing you build after will reach the live site — so prove it here, once.
 
@@ -128,6 +133,50 @@ This is the tool Cowork uses to run every `aws` call in the course (it reads you
 **Verify:** `aws sts get-caller-identity` returns an Account ID and an `Arn` ending in **your admin user's name** (whatever you named it). That `sts` call — not a hardcoded name — is the source of truth that the `[default]` profile is wired. After this, the Cowork AWS API MCP can run every course `aws` command (always with `--region us-east-1` — no `--profile` needed, it's `[default]`).
 
 > ⚠️ **Root is used only once** — to create the admin IAM user. After that, never use root keys. The access key is shown **once**; if you lose it, delete it and make a new one. **Revoke that key when the course ends.** The `[default]` profile has no region, which is why every course command pins `--region us-east-1`.
+
+### 1c — Store the GitHub PAT in Secrets Manager (so you never re-paste it)
+
+Now that AWS is up, save the PAT from "Set up project" step 2 — once stored, every future Cowork session recalls it instead of asking you again. Paste to the agent (swap in your PAT):
+
+ask """
+>
+Store my GitHub PAT in Secrets Manager so future sessions can reuse it (check first, create or update):
+>
+```bash
+aws secretsmanager describe-secret --secret-id flight/github --region us-east-1 --query "Name"
+```
+>
+If that errors with ResourceNotFoundException, create it; if it already exists, update it:
+>
+```bash
+aws secretsmanager create-secret --name flight/github --secret-string '{"pat":"github_pat_REPLACE"}' --region us-east-1
+# (if it already existed:) aws secretsmanager put-secret-value --secret-id flight/github --secret-string '{"pat":"github_pat_REPLACE"}' --region us-east-1
+```
+>
+"""
+
+> From now on, when a milestone needs to push, tell the agent *"use my GitHub PAT from the `flight/github` secret"* — no re-pasting. (It's a write-credential, so it lives in Secrets Manager like every other key — see [[aws-best-practice]] Rule 2.)
+
+### 1d — Cache your Supabase url + anon key in `flight/supabase`
+
+Save the two Supabase values from M0 (`VITE_SUPABASE_URL` + the publishable/anon key) so a future session recalls them. The anon key is **public by design**, so this is a convenience cache, not a runtime secret (no Lambda reads it — Supabase stays auth-only for data). Paste to the agent:
+
+ask """
+>
+Cache my Supabase front-end values so future sessions can recall them (check first, create or update):
+>
+```bash
+aws secretsmanager describe-secret --secret-id flight/supabase --region us-east-1 --query "Name"
+```
+>
+If ResourceNotFoundException, create it; else update it:
+>
+```bash
+aws secretsmanager create-secret --name flight/supabase --secret-string '{"url":"https://REPLACE.supabase.co","anon_key":"sb_publishable_REPLACE"}' --region us-east-1
+# (if it already existed:) aws secretsmanager put-secret-value --secret-id flight/supabase --secret-string '{"url":"https://REPLACE.supabase.co","anon_key":"sb_publishable_REPLACE"}' --region us-east-1
+```
+>
+"""
 
 ## Step 2 — Travelpayouts token
 
