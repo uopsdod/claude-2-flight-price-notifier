@@ -86,6 +86,8 @@ Run each check, report results. (Seed a test subscriber whose `target_price` is 
     --query "Messages[].Body" --region us-east-1
   ```
   The body must carry **`email`**, **`route`**, and a **`cheapest`** object with a sane TWD `price`, an `airline` code, and an ISO `depart_date`. (A verified real body this session: `9325` TWD, airline `LJ`, depart `2026-07-12`.) Garbage/placeholder fields here = the parser parsed the wrong API keys or didn't populate the message — fix before M1.3 consumes it. *(`--visibility-timeout 3` returns it to the queue quickly; don't delete it.)*
+- **C1c** **Dual currency:** the body's **`cheapest.currency` is `"TWD"`** (the gate + headline), and — when the USD call succeeded — there's also a **`cheapest_usd`** block with `currency:"USD"` (the supplementary 約US$ line M1.3 renders). Confirm the **gate used TWD**: the matched subscriber's `target_price` (TWD) ≥ `cheapest.price` (TWD).
+- **C1d** **USD is best-effort (negative case):** if the USD fetch fails/empties, the message **still ships with TWD only** (`cheapest_usd` simply absent) — the alert is never blocked by a missing USD price. (Hard to force on demand; confirm the parser code omits `cheapest_usd` rather than crashing when the USD call returns `None`.)
 - **C2** **No payment guard:** the matched subscriber has **no `subscription_status`** and is still matched — confirms M1 emails anyone eligible (the `active` filter is M2, not here).
 - **C3** A subscriber whose `target_price` is BELOW the live fare is NOT enqueued (the comparison direction is correct).
 
@@ -108,12 +110,14 @@ Run each check, report results. (Seed a test subscriber whose `target_price` is 
 |---|---|---|
 | A1 S3 routes load | ✅/❌ | |
 | A2 fare queue exists | ✅/❌ | |
-| A3 zips in S3 (lambda/, right size) | ✅/❌ | seed-bridge artifacts |
+| A3 zips in S3 (lambda/, ETag==local md5) | ✅/❌ | seed-bridge artifacts — verify ETag, not size |
 | B1 both Lambdas exist | ✅/❌ | |
 | B2 parser invoke ok (clean logs) | ✅/❌ | verify by logs, not output file |
 | B3 realistic TWD fares | ✅/❌ | filter-log-events, not tail |
 | C1 match → enqueued | ✅/❌ | the key one |
 | C1b message body is real | ✅/❌ | email/route/cheapest{price,airline,depart_date} |
+| C1c dual currency (TWD gate + optional USD) | ✅/❌ | cheapest=TWD always, cheapest_usd optional |
+| C1d USD best-effort (TWD-only still ships) | ✅/❌ | missing USD never blocks |
 | C2 no payment guard (status-less row matched) | ✅/❌ | M1 design |
 | C3 below-target NOT enqueued | ✅/❌ | comparison correct |
 | D1 rule enabled (30 min) | ✅/❌ | |

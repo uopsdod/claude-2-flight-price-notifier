@@ -81,9 +81,22 @@ So you **cannot** get a built zip to S3 by any direct path: the sandbox has the 
    (Use the same bridge to write `flight-routes.json`, layer zips — any bytes.)
 4. **Deploy the function from S3:** `aws lambda create-function --code S3Bucket=flight-config-<ACCOUNT_ID>,S3Key=lambda/parser.zip …` (or CFN `Code:{S3Bucket,S3Key}`). Redeploy after an edit = re-seed the new zip, then `aws lambda update-function-code --s3-bucket … --s3-key …`.
 
-> **Always verify the uploaded object size == the local zip size** — a mangled base64 paste yields a same-name object that fails at deploy with `InvalidZipFileException`. And a function whose create **failed** on a bad zip is stuck `State=Failed` — `update-function-code` is blocked; you must **delete and recreate** it.
+> ⚠️ **Verify the uploaded zip by its S3 ETag against the local md5 — a size check is NOT enough.** Pasting a long base64 string into `--payload` corrupts the bytes in **two** ways seen on real runs: (a) a dropped 4-char quartet → object a few bytes short (a size check *would* catch this), **and** (b) a single-character substitution (`o`→`q`) that leaves the length **identical** but the content wrong → a size check **passes**, then `update-function-code` ships a broken zip. For a single-part PUT, **S3's ETag == the object's md5**, so compare it to the local zip's md5:
+> ```bash
+> aws s3api head-object --bucket flight-config-<ACCOUNT_ID> --key lambda/parser.zip \
+>   --query "ETag" --region us-east-1     # strip the quotes → must equal `md5 -q parser.zip`
+> ```
+>
+> **For anything bigger than ~1–2 KB, chunk it** — one fragile giant paste is the single biggest time-sink. Recipe:
+> 1. `base64 -w0 parser.zip` → split into ~600-char pieces **aligned to 4-char boundaries** (each piece decodes to whole bytes; the last carries the `=` padding).
+> 2. Seed each piece to its **own** key via `flight-seed` (short pastes rarely corrupt).
+> 3. **Verify each part's S3 ETag against the local md5 of that decoded piece**; re-seed only a mismatched part.
+> 4. Concatenate the parts with a tiny **`flight-assemble`** Lambda (boto3-only: read each part, write the joined object).
+> 5. **Gate the deploy on `assembled-object ETag == local-zip md5`.**
+>
+> And a function whose create **failed** on a bad zip is stuck `State=Failed` — `update-function-code` is blocked; **delete and recreate** it once the zip verifies.
 
-This is the standard way to land bytes in S3 from an `aws`-only connector — for both **>4096-char function zips** and the **M2 `stripe`+`requests` layer** (`publish-layer-version --content S3Bucket=…,S3Key=…` after seeding `layer.zip`). Note most M1.x functions actually **fold into a single `index.py`** that only uses boto3/stdlib — they need **no layer**; the reason to use S3 is the size cap (and the checklist's S3-artifact check), not file count.
+This is the standard way to land bytes in S3 from an `aws`-only connector — for both **>4096-char function zips** (e.g. M1.3's `flight-fare-notification`, whose folded HTML/text renderer is ~5–6 KB *and* mixes single+double quotes, so inline CFN is doubly impossible) and the **M2 `stripe`+`requests` layer** (`publish-layer-version --content S3Bucket=…,S3Key=…` after seeding `layer.zip`). Note most M1.x functions **fold into a single `index.py`** (boto3/stdlib only, no layer); the reason to use S3 is the **size cap** + the ETag-verifiable artifact, not file count.
 
 ---
 
@@ -175,9 +188,10 @@ Test with `stripe listen --forward-to <api>/stripe-webhook` + `stripe trigger ch
 **Why:** If the visibility timeout is shorter than the Lambda runtime, SQS makes the message visible again **while the Lambda is still processing it**, a second invocation picks it up, and the user gets a **duplicate email**. SQS is at-least-once by design, so even with correct timeouts a retry can re-deliver. The defense is the `notification_history` dedup (24h floor + re-alert thresholds) — which is exactly why dedup lives in the consumer, not the parser.
 
 **How to apply:**
-- Set `VisibilityTimeout` to ≥ (Lambda timeout) when creating the queue; a common safe value is 6× the function timeout.
+- The fare queue ships at the **default 30s**, equal to the Lambda's 30s timeout — that's **not** "≥", it's "==", and a slow send gets redelivered mid-flight. Set a concrete higher value (≈6×): `aws sqs set-queue-attributes --queue-url <url> --attributes VisibilityTimeout=180 --region us-east-1`.
 - `fare_notification` checks `notification_history` **before** sending and writes a history row **after** — so a re-delivered message finds the recent row and skips.
-- Add an event-source mapping (`aws lambda create-event-source-mapping`) rather than polling; let Lambda manage receive/delete.
+- **The consumer role needs all three SQS actions** — `sqs:ReceiveMessage`, `sqs:DeleteMessage`, **and `sqs:GetQueueAttributes`** on the queue. The event-source mapping **fails closed and silently** (never polls, no error in the function log) if any is missing — distinct from the producer's `SendMessage`/`GetQueueUrl`.
+- **Creating the event-source mapping immediately drains whatever is already on the queue.** Before you create it, **`aws sqs purge-queue --queue-url <url>`** to clear stale test messages, then seed one clean test subscriber — otherwise old/undeliverable matches burst through at once (and, on the demo sender, become a wave of `403`s that can trip Resend's rate limit). For permanent-failure protection without a full DLQ, set a redrive policy with a small `maxReceiveCount`.
 
 ---
 

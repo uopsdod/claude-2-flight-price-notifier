@@ -82,7 +82,8 @@ def handler(e, c):
     s = json.loads(boto3.client("secretsmanager").get_secret_value(SecretId="flight/resend")["SecretString"])
     body = {"from": s["from"], "to": s["test_to"], "subject": "resend test", "html": "<p>it works</p>", "text": "it works"}
     req = urllib.request.Request("https://api.resend.com/emails", data=json.dumps(body).encode(),
-        headers={"Authorization": "Bearer " + s["api_key"], "Content-Type": "application/json"}, method="POST")
+        headers={"Authorization": "Bearer " + s["api_key"], "Content-Type": "application/json",
+                 "User-Agent": "Mozilla/5.0 (compatible; flight-notifier/1.0)"}, method="POST")  # UA: Resend is behind Cloudflare
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             print("RESEND_OK", r.status, r.read().decode())
@@ -106,7 +107,14 @@ aws logs filter-log-events --log-group-name /aws/lambda/flight-resend-test --que
 >
 """
 
-**Expect** a log line `RESEND_OK 200 {"id":"..."}` **and** the test email in your Resend-account inbox (check spam). `RESEND_ERR 401` = wrong key; `RESEND_ERR 403/422` = a `from` you're not allowed to send from (stay on `onboarding@resend.dev` until M3). When it passes, delete the throwaway:
+**Expect** a log line `RESEND_OK 200 {"id":"..."}` **and** the test email in your Resend-account inbox (check spam). Reading the errors:
+- `RESEND_ERR 401` = wrong/missing key.
+- `RESEND_ERR 403/422` = a `from` you're not allowed to send from (stay on `onboarding@resend.dev` until M3).
+- `RESEND_ERR 403` with a body of **`error code: 1010`** (not Resend JSON) = **Cloudflare** blocked the default urllib User-Agent — the handler above already sets a `User-Agent`, so this only bites if you dropped that header.
+
+> ⚠️ **`test_to` must be your Resend-ACCOUNT email** — the address you signed up to Resend with, which is often **NOT** your app/login email. On the demo sender, Resend only delivers to the account email; a send to anything else logs `200` but never arrives (see [[resend-best-practice]] Rule 1). When you later seed the M1.3 test *subscriber*, use that same Resend-account email as its `email`.
+
+When it passes, delete the throwaway:
 
 ```bash
 aws cloudformation delete-stack --stack-name flight-resend-test --region us-east-1

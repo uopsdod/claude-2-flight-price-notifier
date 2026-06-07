@@ -74,7 +74,7 @@ Run these M1.1-carryover checks in us-east-1 and show me each result:
 >
 2. Lambda role exists: `aws iam get-role --role-name flight-lambda-role --query "Role.RoleName" --region us-east-1`
 >
-3. Secrets exist: `aws secretsmanager list-secrets --region us-east-1 --query "SecretList[].Name"` — expect `flight/travelpayouts` in the list (no `flight/supabase`).
+3. Secrets exist: `aws secretsmanager list-secrets --region us-east-1 --query "SecretList[].Name"` — expect `flight/travelpayouts` in the list (plus the convenience-cache `flight/github` + `flight/supabase` from the M1.1 prereq).
 >
 4. Both DynamoDB tables ACTIVE: `aws dynamodb describe-table --table-name subscriptions --region us-east-1 --query "Table.TableStatus"` and the same for `notification_history`.
 >
@@ -93,6 +93,8 @@ https://api.travelpayouts.com/v1/prices/cheap?origin=TPE&destination=TYO&depart_
 """
 
 > *(CLI: `curl -s "https://api.travelpayouts.com/v1/prices/cheap?origin=TPE&destination=TYO&depart_date=2026-07&currency=usd&token=<token>" | head -c 200` → expect `"success":true`.)*
+
+> **One token, both currencies.** M1.2's parser fetches each route in **`twd`** (the gate) **and** **`usd`** (the email's supplementary line) — the **same `flight/travelpayouts` token serves both**; no new secret. (You can sanity-check by swapping `currency=twd`/`usd` in the URL above.)
 
 **Build tools** — M1.2 ships a Lambda zip, and **Cowork builds it in the bash sandbox** (the `aws`-only connector can't `zip`), then moves it to S3 via the `flight-seed` bridge. So you **do** need `zip` available in the sandbox: `python3 --version && which zip`. (Only a connector that exposes its own writable shell workdir could skip the sandbox — see the capability probe above.)
 

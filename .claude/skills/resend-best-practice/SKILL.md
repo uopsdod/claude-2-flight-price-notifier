@@ -86,6 +86,18 @@ Resend is a hosted REST API; the calling code (the Lambda) runs identically in b
 
 ---
 
+### Rule 3a — Classify failures: RETRY transient (429/5xx), DROP permanent (403/422) — or you loop forever
+
+> **The rule:** M1 has **no DLQ**, so a Lambda that raises on **every** non-2xx makes SQS redeliver that message **forever**. Distinguish: **transient** (`429` rate-limit, `5xx`) → raise/return non-success so SQS retries with backoff; **permanent** (`403`, `422` — including the demo-sender `403` to a non-account address, and malformed-payload `422`) → **log and DROP** (return success so SQS deletes it). It will never succeed on retry.
+
+**Why:** A real incident: stale `test@example.com` messages left on the fare queue from M1.2 testing were undeliverable on the demo sender (`403`, permanent). When the event-source mapping was enabled they retried in a tight loop and **cascaded into a Resend `429`** — turning a few dead messages into a rate-limit outage for the live ones. "Let SQS redeliver on any failure" is only safe for *transient* failures.
+
+**How to apply:**
+- In the consumer, branch on the HTTP status: `429`/`5xx` → re-raise (redeliver); `403`/`422` → `print` the body + return normally (drop). Write `notification_history` **only** after a real 2xx.
+- **Purge stale test messages** (`aws sqs purge-queue`) before enabling the mapping, and set a redrive policy with a small `maxReceiveCount` as a backstop even though full DLQs stay out of M1 scope (see [[aws-best-practice]] Rule 5).
+
+---
+
 ### Rule 4 — Send a plain REST POST, not the SDK — keep the Lambda layer pure-Python, and send BOTH `html` and `text`
 
 > **The rule:** Send via `POST https://api.resend.com/emails` with `Authorization: Bearer <api_key>` and a JSON body that includes **both `html` and `text`**. Use `requests` (in the shared layer) or stdlib `urllib` — **do not** add the `resend` PyPI SDK.
@@ -94,18 +106,21 @@ Resend is a hosted REST API; the calling code (the Lambda) runs identically in b
 
 **How to apply:**
 ```python
-import json, urllib.request
+import json, urllib.request, urllib.error
 def send_email(api_key, frm, to, subject, html, text):
     body = {"from": frm, "to": to, "subject": subject, "html": html, "text": text}
     req = urllib.request.Request(
         "https://api.resend.com/emails",
         data=json.dumps(body).encode(),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
+                 # Resend sits behind Cloudflare — the default `Python-urllib/3.x` UA gets a
+                 # 403 with body `error code: 1010`. A custom User-Agent fixes it.
+                 "User-Agent": "Mozilla/5.0 (compatible; flight-notifier/1.0)"},
         method="POST")
     with urllib.request.urlopen(req, timeout=10) as r:
         return json.loads(r.read())     # {"id": "…"} on success
 ```
-`email_render.py` produces both the HTML card and a plain-text version — pass both. A **2xx with an `id`** = accepted (not "delivered" — Rule 8). Non-2xx = failure: log it, **don't** write `notification_history` (Rule 3), let SQS redeliver.
+Pass both `html` and `text`. A **2xx with an `id`** = accepted (not "delivered" — Rule 8). On a non-2xx, **classify before you react** (Rule 3a): **`429`/`5xx`** = transient → don't write `notification_history`, let SQS redeliver; **`403`/`422`** = permanent → log + **drop** (don't loop).
 
 ---
 
@@ -131,9 +146,9 @@ def send_email(api_key, frm, to, subject, html, text):
 
 ---
 
-### Rule 7 — Respect the rate limit (~2 req/s) — one email per SQS message paces it; retry on `429`
+### Rule 7 — Respect the rate limit (5 req/s) — one email per SQS message paces it; retry on `429`
 
-> **The rule:** Resend's default send rate is roughly **2 requests/second**. Don't fire one synchronous POST per subscriber in a tight loop or you'll get **`429 Too Many Requests`**. The SQS decoupling already paces this (one message = one invocation = one send). On a `429`, **retry** (let SQS redeliver), don't drop.
+> **The rule:** Resend's default send rate is **5 requests/second** (the live `429` body says *"You can only make 5 requests per second."*). Don't fire one synchronous POST per subscriber in a tight loop or you'll get **`429 Too Many Requests`**. The SQS decoupling already paces this (one message = one invocation = one send). A `429` is **transient** → retry (let SQS redeliver), don't drop (Rule 3a).
 
 **Why:** At course scale (a few test subscribers) you won't hit it — but the design is built to scale, and a future burst (many subscribers, one big drop) is exactly when a naive per-subscriber loop trips the limit. The **fare SQS queue → per-message Lambda** model spreads sends over time, which is why the send lives in the consumer, not the parser.
 
@@ -151,7 +166,7 @@ def send_email(api_key, frm, to, subject, html, text):
 **Why:** The Lambda log shows the POST returned 200 and stops there — but mail can still **bounce** (bad recipient), **spam-folder** (unverified `from`, Rule 2), be **dropped**, or simply not reach a non-account address on the demo sender (Rule 1). "The Lambda says it sent but I got nothing" is almost always a deliverability outcome visible only in Resend's per-message log, never in CloudWatch.
 
 **How to apply:**
-- **M1.3 verify** = a real alert lands in **your** inbox (subject 「✈️ 台北 → 東京 降價通知！…」, USD headline + 約 NT$, 「立即訂購」 button) — check spam if missing.
+- **M1.3 verify** = a real alert lands in **your** inbox (subject 「✈️ 台北 → 東京 降價通知！…」, **NT$ headline + optional 約 US$**, 「立即訂購」 button) — check spam if missing.
 - Debug order for a missing email: **recipient == account email?** (Rule 1) → Resend Email log (what happened?) → `from` domain verified? (Rule 2) → Lambda log (did it even POST, or did dedup correctly skip it? — Rule 3).
 
 ---
@@ -160,7 +175,7 @@ def send_email(api_key, frm, to, subject, html, text):
 
 > **The rule:** `to` is the subscriber's email — the same `email` that is the DynamoDB `subscriptions` partition key and the Supabase auth identity. The HTML/text body is built by `flightproxy/email_render.py` from the queued fare; don't hand-assemble email strings in the handler.
 
-**Why:** `email` is the one join key across Supabase auth ↔ DynamoDB ↔ the alert — sending to anything else (e.g. a Stripe billing email) mis-routes the alert. And the renderer already produces the correct bilingual card (USD headline + 約 NT$, the 「立即訂購」 link), the subject, and the plain-text part; re-implementing it inline drifts from what the checklist verifies. Resend `to` accepts a single address or a list (≤50) — here it's the **one** subscriber.
+**Why:** `email` is the one join key across Supabase auth ↔ DynamoDB ↔ the alert — sending to anything else (e.g. a Stripe billing email) mis-routes the alert. And the renderer already produces the correct bilingual card (**NT$ headline + optional 約 US$**, the 「立即訂購」 link), the subject, and the plain-text part; keeping the render logic in one place keeps it consistent with what the checklist verifies. Resend `to` accepts a single address or a list (≤50) — here it's the **one** subscriber.
 
 **How to apply:**
 - `to = message["email"]`, `subject = email_render.subject(...)`, `html = email_render.render_html(...)`, `text = email_render.render_text(...)`.
@@ -188,11 +203,13 @@ def send_email(api_key, frm, to, subject, html, text):
 3. **Send-before-dedup** → inbox spam every 30 min (Rule 3). Query `notification_history` first; write it only after a 2xx.
 4. **html-only body** → hurts deliverability; always include a `text` part, and avoid `<table>`/image-heavy "marketing-looking" HTML (Rule 4).
 5. **Lambda in a VPC** → the POST to `api.resend.com` hangs to timeout with no clear error (Rule 6). Remove the VPC config.
-6. **`429` under fan-out** → exceeded ~2 req/s (Rule 7). One-email-per-SQS-message paces it; retry on 429, don't drop.
-7. **"200 but no email"** → check the **Resend dashboard Email log**, not CloudWatch (Rule 8) — it's a deliverability outcome.
-8. **Wrong JSON key** → Resend expects `from`/`to`/`subject`/`html`/`text`; a wrong key (`from_email`, `sender`) is a `422`.
-9. **`put-secret-value` replaces the whole value** — include **both** `api_key` and `from`, or you'll drop one (same wholesale-replace gotcha as every secret).
-10. **CLI binary is `resend`** (not `resend-cli`) if a student uses it for the test send.
+6. **`429` under fan-out** → exceeded **5 req/s** (Rule 7). One-email-per-SQS-message paces it; retry on 429, don't drop. Watch for a `429` **cascade** from a backlog of permanent-failure messages looping (Rule 3a).
+7. **`403` with body `error code: 1010`** → **Cloudflare** blocking the default `Python-urllib/3.x` User-Agent (Rule 4). Set a custom `User-Agent`. Looks like a bad key — it isn't.
+8. **Looping forever on a permanent failure** → `403`/`422` redelivered with no DLQ (Rule 3a). Drop permanent, retry only transient; purge stale test messages before enabling the mapping.
+9. **"200 but no email"** → check the **Resend dashboard Email log**, not CloudWatch (Rule 8) — it's a deliverability outcome.
+10. **Wrong JSON key** → Resend expects `from`/`to`/`subject`/`html`/`text`; a wrong key (`from_email`, `sender`) is a `422`.
+11. **`put-secret-value` replaces the whole value** — include **both** `api_key` and `from`, or you'll drop one (same wholesale-replace gotcha as every secret).
+12. **CLI binary is `resend`** (not `resend-cli`) if a student uses it for the test send.
 
 ---
 

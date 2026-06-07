@@ -56,7 +56,7 @@ Run each check and report. You'll seed a test match (a subscriber whose `target_
   aws logs filter-log-events --log-group-name /aws/lambda/flight-fare-notification \
     --query "events[].message" --region us-east-1
   ```
-- **B2** **The decisive test:** the inbox receives the alert (subject 「✈️ 台北 → 東京 降價通知！NT$9,531 已達標」). Confirm the card shows the USD headline + 約 NT$, the user's target, and the 「立即訂購」 button.
+- **B2** **The decisive test:** the inbox receives the alert (subject 「✈️ 台北 → 東京 降價通知！NT$9,325 已達標」). Confirm the card shows the **NT$ headline** (+ a small **約 US$** line when the message had `cheapest_usd`), the user's target, and the 「立即訂購」 button.
 - **B3** **No payment guard:** the subscriber was emailed despite having **no `subscription_status`** — confirms M1 emails anyone eligible (the guard is M2).
 
 ### Section C — Dedup blocks repeats

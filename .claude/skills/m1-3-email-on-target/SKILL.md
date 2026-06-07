@@ -69,7 +69,7 @@ M1.3 **builds the Notification box** (right) — the consumer side of the **SQS*
         對每則訊息 {email, route, cheapest, target_price}：
           · Query notification_history (pk="email#route") 最新一筆
           · 該寄嗎？ 24h 內沒寄過 OR 這次比上次便宜 ≥20% 或 ≥NT$2000  → 寄
-          · email_render.py 產生信（USD 標價 + 約 NT$ + 立即訂購）→ POST Resend
+          · email_render.py 產生信（NT$ 標價 headline + 約 US$ 補充 + 立即訂購）→ POST Resend
           · PutItem notification_history（email, route, sent_at, price）
 ```
 
@@ -89,24 +89,45 @@ If it's missing → go back and run the M1.3 prereq Step 1. (Sending stays from 
 
 ### Step 2 — Write the fare-notification Lambda (consumer + dedup)
 
-`aws/fare_notification/handler.py` (triggered per SQS message):
+This is a **single self-contained `index.py`** (handler `index.handler`) — you write the renderer functions inline (Step 2 box below). It's **too big for inline CFN** (the folded HTML/text renderer is ~5–6 KB, over the 4096-char cap — and the handler mixes single + double quotes, which breaks shell-escaping a CFN template body), so it deploys via the **S3 `flight-seed` bridge** (Method 2), like the M1.2 parser. Triggered per SQS message, it:
 1. Read `flight/resend` from Secrets Manager (for the API key + `from`).
 2. For the message's `{email, route}`, **`Query notification_history`** on `pk = f"{email}#{route}"`, newest first, limit 1.
+   - **Key schema (matters for the query):** `notification_history` is **`pk` (HASH, type S)** + **`sent_at` (RANGE/sort key, type S — ISO-8601 UTC string, e.g. `2026-06-07T12:00:00Z`)**. Because `sent_at` is a **sortable String** sort key, `Query … ScanIndexForward=False, Limit=1` returns the **latest** alert for that pk. **Don't** store `sent_at` as an epoch **Number** — that changes the range-key type and breaks the table / the "newest first" ordering.
 3. **Decide to send** (the configurable rules — read from env vars):
    - If no recent row, or the last `sent_at` is **older than `NOTIFY_FLOOR_HOURS`** → **send**.
    - Else, within the floor, send only if the new fare is meaningfully cheaper than the last alerted `price`:
      `new <= last * (1 - REALERT_PCT/100)` **OR** `(last - new) >= REALERT_ABS_TWD`.
    - Otherwise **skip** (log "skipped (deduped)").
-4. **Build the email** with `email_render.py`:
-   - `subject(fare, twd_price)` → 「✈️ 台北 → 東京 降價通知！NT$9,531 已達標」
-   - `render_html(fare, target_price, manage_url=…, twd_price=…)` → cheapest-ticket card, **USD headline + 約 NT$ supplementary**, single **「立即訂購」** button via `fare.booking_url(currency="usd")`. The message from M1.2 carries both the USD and TWD cheapest (the parser does both `usd`+`twd` calls), so pass `twd_price`. *(The booking link works with no affiliate `marker` — the subscriber can still book, it's just un-attributed. Earning commission is optional and out of scope for the notifier — see "Optional: monetize the booking link" below.)*
-5. **POST to Resend**, then **`PutItem notification_history`** `{pk, sent_at(now), email, route, price, currency}`.
+4. **Build the email** from the message's **`cheapest` (TWD)** as the headline + the optional **`cheapest_usd` (USD)** as a supplementary line:
+   - `subject(fare)` → 「✈️ 台北 → 東京 降價通知！NT$9,325 已達標」 — leads with **NT$** (the gating currency).
+   - `render_html(fare, target_price, usd_price=…)` → cheapest-ticket card with an **NT$ headline + optional 約 US$ supplementary** line (rendered **only when** the message has `cheapest_usd`), and a single **「立即訂購」** button via `fare.booking_url(currency="twd")`. *(The booking link works with no affiliate `marker` — un-attributed; monetizing is optional, see "Optional: monetize the booking link" below.)*
+   - Here `fare` is built from **`cheapest`** (the TWD block, always present); pass `usd_price=message["cheapest_usd"]["price"]` **only if** `cheapest_usd` is in the message, else omit it (TWD-only card).
+5. **POST to Resend** (set a `User-Agent` header — see Step 1 note), then **`PutItem notification_history`** `{pk, sent_at(now, ISO-8601 UTC), email, route, price, currency}`.
+   - **Handle the failure classes — don't blindly redeliver** (M1 has no DLQ, so a raised exception retries **forever**): on a **transient** error (**`429`, `5xx`**) raise/return non-success so SQS redelivers with backoff; on a **permanent** error (**`403`, `422`** — e.g. the demo-sender `403` to a non-account address, a malformed payload) **log and DROP** (return success so the message is deleted) — these will never succeed on retry, and a tight retry loop triggers a Resend **`429` cascade**. Write the history row **only after a real 2xx**.
 
-`email_render.py` is copied into the zip at build (`cp flightproxy/email_render.py aws/fare_notification/`).
+> **You WRITE `email_render.py` here — it doesn't exist yet.** No prior milestone created `flightproxy/email_render.py` or a `Fare` class, so don't `cp`/"reuse" it. Fold these functions into the consumer's `index.py` (or a small module you author). Required interface:
+> - **`subject(fare) -> str`** → 「✈️ {台北 → 東京} 降價通知！NT${price} 已達標」 (TWD).
+> - **`render_html(fare, target_price, marker=None, usd_price=None) -> str`** → **NT$ headline** + an optional 約 US$ line (only when `usd_price` given) + a 「立即訂購」 button. Keep it **simple, table-free, transactional** HTML (table-/image-heavy mail reads as marketing — see [[resend-best-practice]]).
+> - **`render_text(fare, target_price, marker=None, usd_price=None) -> str`** → plain-text fallback (always send `html` **and** `text` — deliverability).
+> - **`booking_url(fare, marker=None) -> str`** → an Aviasales deep link `ORIGIN+DDMM+DEST+DDMM` (+ passengers); append `?marker=` **only when** a marker is provided.
+> A reference implementation lives in `flightproxy/email_render.py` in the repo — use it as the spec for what you fold inline.
 
-**Wire the SQS trigger + the config env vars + the IAM perms:**
+**First: extend the IAM role with the CONSUMER-side SQS perms.** The role so far only has the *producer* perms (`sqs:SendMessage`/`GetQueueUrl` from M1.2). The event-source mapping needs **all three** of `sqs:ReceiveMessage`, `sqs:DeleteMessage`, **and `sqs:GetQueueAttributes`** on the fare queue — **miss any one and the mapping silently fails closed** (it just never polls; no error in the function log). Add them to `flight-lambda-role`'s `flight-data` policy (merge — don't drop existing statements; DynamoDB on `notification_history` is already granted from M1.1).
+
+**Set a real VisibilityTimeout BEFORE wiring** — the queue ships at the default **30s**, equal to the Lambda's 30s timeout, but Rule 5 needs **strictly greater** (≈6×). Set it to **180s** so a slow send isn't redelivered mid-flight:
 ```bash
-# event-source mapping: fare queue → this Lambda
+aws sqs set-queue-attributes --queue-url <flight-fare-queue-URL> \
+  --attributes VisibilityTimeout=180 --region us-east-1
+```
+
+**Then PURGE stale test messages before creating the mapping** — creating the mapping **instantly drains whatever is already on the queue**. Old `test@example.com` matches from M1.2 testing (undeliverable on the demo sender) would burst through as `403`s and trip a Resend `429` cascade. Purge first, then seed one clean test subscriber:
+```bash
+aws sqs purge-queue --queue-url <flight-fare-queue-URL> --region us-east-1
+```
+
+**Now wire the trigger + the config knobs:**
+```bash
+# event-source mapping: fare queue → this Lambda (drains the queue on creation — purge first, above)
 aws lambda create-event-source-mapping \
   --function-name flight-fare-notification \
   --event-source-arn <flight-fare-queue-ARN> \
@@ -115,17 +136,15 @@ aws lambda create-event-source-mapping \
 aws lambda update-function-configuration --function-name flight-fare-notification \
   --environment 'Variables={NOTIFY_FLOOR_HOURS=24,REALERT_PCT=20,REALERT_ABS_TWD=2000}' \
   --region us-east-1
-# extend flight-lambda-role: sqs Receive/Delete on the fare queue (the mapping handles delete);
-#   dynamodb on notification_history is already granted from M1.1.
 ```
-Also set the queue's **`VisibilityTimeout` ≥ this Lambda's timeout** (see [[aws-best-practice]] Rule 5) so a slow send isn't re-delivered mid-flight.
+*(Optional but recommended even without a full DLQ: a redrive policy with a small `maxReceiveCount` so a permanent-failure message can't retry forever — see the failure-class handling in Step 2.5.)*
 
 **Verify before moving on:** with a seeded match on the queue (re-run the M1.2 parser if needed), the consumer sends one email (read its logs with `filter-log-events` — the MCP rejects `logs tail`):
 ```bash
 aws logs filter-log-events --log-group-name /aws/lambda/flight-fare-notification \
   --query "events[].message" --region us-east-1
 ```
-Inbox receives the alert (subject 「✈️ 台北 → 東京 降價通知！NT$9,531 已達標」, USD headline + 約 NT$, 「立即訂購」 button).
+Inbox receives the alert (subject 「✈️ 台北 → 東京 降價通知！NT$9,325 已達標」, **NT$ headline + optional 約 US$**, 「立即訂購」 button).
 
 ### Step 3 — Prove dedup + the re-alert threshold
 
@@ -170,6 +189,11 @@ Skip all of this and the milestone is still complete; the booking link just earn
 6. **SQS visibility timeout ≥ Lambda timeout** + idempotent consumer — SQS is at-least-once; the `notification_history` check is what makes a re-delivery safe (see [[aws-best-practice]] Rule 5).
 7. **Decimal** — `price`/`target_price` are DynamoDB Numbers (`Decimal`); convert before arithmetic/JSON (see [[aws-best-practice]] Rule 3).
 8. **Empty fares never reach here** — the parser skips empty Travelpayouts results, so a message on the queue always carries a real fare.
+9. **TWD is the headline, USD is supplementary** — read **`cheapest`** (TWD) for the gate/dedup/headline; render the 約 US$ line only when the message has **`cheapest_usd`** (it's optional — the parser omits it if the USD fetch failed). The subject is NT$.
+10. **Drop permanent failures, retry only transient** — `403`/`422` (incl. demo-sender to a non-account address) → log + delete; `429`/`5xx` → let SQS redeliver. With no DLQ, raising on a permanent error loops forever and triggers a `429` cascade.
+11. **This Lambda deploys via the S3 bridge, not inline** — the folded renderer is >4096 chars and mixes quote types; use Method 2 (see [[aws-best-practice]]).
+12. **Cloudflare blocks the default urllib UA** — POST to `api.resend.com` with a custom `User-Agent` or you get `403` `error code: 1010` (looks like a bad key — it isn't). See [[resend-best-practice]] Rule 4.
+13. **`notification_history` `sent_at` is an ISO-8601 String sort key** — not an epoch Number, or the range-key type / "newest first" query breaks.
 
 ## Expected duration
 
@@ -182,7 +206,7 @@ When `m1-3-email-on-target-checklist` is green: 「M1.3 完成！達標會真的
 ## Reference
 
 - Resend API: https://resend.com/docs/api-reference/emails/send-email
-- Reused renderer: `flightproxy/email_render.py`; booking link via `Fare.booking_url()` (no marker needed).
+- Renderer: **write** `subject`/`render_html`/`render_text`/`booking_url` inline (Step 2) — `flightproxy/email_render.py` in the repo is the reference spec (NT$ headline + optional 約 US$; marker optional).
 - Dedup pattern modeled on the sibling bag-notification service's history-table + window approach.
-- [[aws-best-practice]] — SQS visibility timeout, Decimal, layer packaging.
+- [[aws-best-practice]] — Cowork S3 deploy (Method 2), SQS visibility timeout, Decimal, the event-source-mapping IAM actions.
 - [[resend-best-practice]] — the demo-sender-only-to-self trap, verified-`from` deliverability, dedup-before-send, html+text, no-VPC, rate limits.
