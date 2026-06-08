@@ -13,7 +13,7 @@ When guiding a student through any Resend-touching code, **apply these rules pro
 
 > **Model note (differs from a source Resend project):** a sibling project used Resend the **Next.js** way — the `resend` npm SDK + a `lib/resend.ts` lazy client + Audiences/Broadcasts + an unsubscribe route. This course is **AWS Lambda + a plain REST POST + a single transactional alert** (no SDK, no audiences, no broadcasts, no unsubscribe flow). The deliverability principles (verified `from`, text+html, demo-sender-only-to-self) carry over; the SDK/Next.js/MCP plumbing does **not** and is dropped.
 
-This is the email-layer sibling of [[aws-best-practice]] (the Lambda/IAM/secrets/no-VPC side of the same send) and [[m1-3-email-on-target]] (where the send is wired). The `from`-domain story finishes in [[m3-custom-domain-go-live]].
+This is the email-layer sibling of [[aws-best-practice]] (the Lambda/IAM/secrets/no-VPC side of the same send) and [[m1-flight-price-checker]] (Part 1.3, where the send is wired). The `from`-domain story finishes in [[m3-custom-domain-go-live]].
 
 ---
 
@@ -41,7 +41,7 @@ Resend is a hosted REST API; the calling code (the Lambda) runs identically in b
 **Why:** This is the same **two-host gap** that shapes the AWS deploy ([[aws-best-practice]] *Cowork execution constraints*): the sandbox has tools but no network to arbitrary hosts; the connectors (AWS MCP) have network but aren't a shell. A GET check (like the Travelpayouts token URL) sneaks through the agent's web-fetch — but Resend needs a **POST + `Authorization` header + body**, which web-fetch can't do and the sandbox can't route. Students hit a confusing `blocked-by-allowlist / 403 on CONNECT` and think their key is wrong; it isn't — the *path* is wrong.
 
 **How to apply:**
-- **Verify the key in the prereq** by deploying a tiny **`flight-resend-test`** Lambda (inline CFN, reads `flight/resend`, POSTs to Resend) and invoking it via the AWS MCP — the Lambda runs *inside AWS* and has internet. Read the result from its **logs** (`filter-log-events`) + your inbox, not the invoke output (the MCP can't read that file). See [[m1-3-email-on-target-prerequisites]] Step 1.
+- **Verify the key in the prereq** by deploying a tiny **`flight-resend-test`** Lambda (inline CFN, reads `flight/resend`, POSTs to Resend) and invoking it via the AWS MCP — the Lambda runs *inside AWS* and has internet. Read the result from its **logs** (`filter-log-events`) + your inbox, not the invoke output (the MCP can't read that file). See [[m1-flight-price-checker-prerequisites]] Part E.
 - **The real alert** is sent the same way — from `flight-fare-notification`, a Lambda. That's why M1.3's design never sends from the browser or the sandbox.
 - **Zero-code alternative for a pure key check:** the **Resend dashboard → Emails → Send** button (no network needed from your side at all).
 
@@ -225,9 +225,9 @@ Pass both `html` and `text`. A **2xx with an `id`** = accepted (not "delivered" 
 
 ## Cross-references
 
-- [[m1-3-email-on-target]] — where the send is wired (the `flight-fare-notification` consumer + `flight/resend`).
-- [[m1-3-email-on-target-prerequisites]] — Resend account + sending key + the one-off test send.
-- [[m1-3-email-on-target-checklist]] — verifies the alert actually lands and that dedup holds.
+- [[m1-flight-price-checker]] — Part 1.3, where the send is wired (the `flight-fare-notification` consumer + `flight/resend`).
+- [[m1-flight-price-checker-prerequisites]] — Part E: Resend account + sending key + the test-Lambda send.
+- [[m1-flight-price-checker-checklist]] — verifies the alert lands and that dedup holds (Sections J–L).
 - [[m3-custom-domain-go-live]] — verifying your own sending domain (SPF/DKIM) and flipping the `from`.
 - [[aws-best-practice]] — Rule 2 (secrets), Rule 5 (SQS visibility timeout), Rule 6 (pure-Python layer), Rule 7 (no VPC) — the AWS side of the same send.
 - [[stripe-best-practice]] — the M2 welcome/cancel email follows the same dedup-via-status-SQS pattern.

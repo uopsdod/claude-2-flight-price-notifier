@@ -25,7 +25,7 @@ The hard rules apply identically in both — only the command surface differs.
 | Read a Lambda's logs | `aws logs tail /aws/lambda/<fn> --since 10m --follow` | `aws logs filter-log-events --log-group-name /aws/lambda/<fn> --query "events[].message"` (the MCP rejects `logs tail`) |
 | Inspect a DynamoDB row | `aws dynamodb get-item --table-name subscriptions --key '{...}'` | `call_aws dynamodb get-item ...` |
 
-**Profile/region:** the course uses the **`[default]`** AWS profile (no `--profile` flag needed). It has **no default region**, so **every** call passes `--region us-east-1`. In Cowork the AWS API MCP reads `~/.aws/credentials`'s `[default]` block (written via a Claude CLI session — see [[m1-1-subscribe-to-a-plan-prerequisites]]). Forgetting the region is the #1 "it works for me but not in the script" gap.
+**Profile/region:** the course uses the **`[default]`** AWS profile (no `--profile` flag needed). It has **no default region**, so **every** call passes `--region us-east-1`. In Cowork the AWS API MCP reads `~/.aws/credentials`'s `[default]` block (written via a Claude CLI session — see [[m1-flight-price-checker-prerequisites]]). Forgetting the region is the #1 "it works for me but not in the script" gap.
 
 ---
 
@@ -288,9 +288,7 @@ When a student asks "shouldn't we add a DLQ / split the role / add a GSI?" → "
 
 ## Cross-references
 
-- [[m1-1-subscribe-to-a-plan]] — DynamoDB table + `save_subscription` Lambda + API Gateway (Rule 3, IAM).
-- [[m1-2-fetch-prices-on-schedule]] — `parser_wrapper`/`parser` + EventBridge + S3 routes.
-- [[m1-3-email-on-target]] — `fare_notification` + SQS + `notification_history` dedup (Rules 5).
+- [[m1-flight-price-checker]] — the whole M1 build: DynamoDB + `save_subscription`/API GW (Part 1.1), `parser_wrapper`/`parser` + EventBridge + S3 routes (Part 1.2), `fare_notification` + SQS + `notification_history` dedup (Part 1.3).
 - [[m2-stripe-subscription]] — the webhook + the raw-body signature rule (Rule 4).
 - [[stripe-best-practice]] — the application side of the same webhook.
 - [[supabase-best-practice]] — why no AWS key lives in the front-end (Supabase is the only thing the browser talks to, auth-only).
