@@ -97,7 +97,7 @@ The `flight/travelpayouts` token was stored in the prereq. Confirm it's present 
 ```bash
 aws secretsmanager list-secrets --region us-east-1 --query "SecretList[].Name"   # expect flight/travelpayouts (+ the cache flight/github, flight/supabase)
 ```
-(The fetch API authenticates on the **token** alone — no `marker`. DynamoDB needs **no** secret; the Lambda reaches it via IAM. `flight/supabase` exists but the Lambda never reads it — it caches the front-end's url+anon for session recall; Supabase stays auth-only for data. See [[aws-best-practice]] Rule 2.)
+(The fetch API authenticates on the **token** alone — no `marker`. DynamoDB needs **no** secret; the Lambda reaches it via IAM. `flight/supabase` exists but the Lambda never reads it — it caches the front-end's url + publishable key for session recall; Supabase stays auth-only for data. See [[aws-best-practice]] Rule 2.)
 
 ### Step 3 — Create the shared Lambda IAM role
 
@@ -425,7 +425,7 @@ A recent `sent_at`+`price`; the immediate re-run skipped; the big-drop wrote a n
 ## Things to watch out for (whole milestone)
 
 1. **No payment guard in M1** — no `subscription_status` anywhere; everyone who subscribes is eligible. The paywall (status + Stripe webhook + active-only parser filter) is **M2**.
-2. **CORS + no-AWS-creds-in-front-end** — set CORS on the HTTP API; the browser only POSTs to API Gateway; only Lambdas touch AWS (the Supabase anon key in the front-end is fine — auth-only).
+2. **CORS + no-AWS-creds-in-front-end** — set CORS on the HTTP API; the browser only POSTs to API Gateway; only Lambdas touch AWS (the Supabase publishable key in the front-end is fine — public, auth-only).
 3. **Decimal, not float** — `target_price`/`price` to DynamoDB as `Decimal(str(x))`; convert back for JSON ([[aws-best-practice]] Rule 3).
 4. **Deploy method by size** — 1-file ≤4096 chars → inline CFN; bigger (parser, notification) → the `flight-seed` S3 bridge, **verify by ETag==md5** (size misses a same-length corruption).
 5. **Parse the API's real keys** — `departure_at`/`return_at`, not `depart_date`/`return_date`, or you get silently-empty fares.
