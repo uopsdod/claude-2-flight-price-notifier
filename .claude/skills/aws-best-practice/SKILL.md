@@ -1,6 +1,6 @@
 ---
 name: aws-best-practice
-description: Hard rules and operational SOP for the AWS side of the Flight Price Notifier course — a SERVERLESS stack (Lambda + DynamoDB + SQS + S3 + API Gateway + EventBridge + Secrets Manager). Use whenever a student is packaging a Lambda, writing to DynamoDB, wiring SQS, handling the Stripe webhook, managing secrets, or debugging an AWS-side failure in M1+. Sourced from this stack's real failure modes.
+description: Hard rules and operational SOP for the AWS side of the Flight Price Notifier course — a SERVERLESS stack (Lambda + DynamoDB + SQS + S3 + API Gateway + EventBridge + Secrets Manager). Use whenever a student is packaging a Lambda, writing to DynamoDB, wiring SQS, handling the ECPay callbacks (CheckMacValue), managing secrets, or debugging an AWS-side failure in M1+. Sourced from this stack's real failure modes.
 ---
 
 # AWS Best Practice (Flight Price Notifier — serverless)
@@ -53,7 +53,7 @@ So you **cannot** get a built zip to S3 by any direct path: the sandbox has the 
 
 **Method 1 — inline `Code.ZipFile` (single small file).** Send the code *inside* the API call — **CloudFormation with inline `Code.ZipFile`**: `aws cloudformation create-stack --template-body '<json>'`, function code inline, no file transfer. **Limits: single file, ≤4096 chars, handler `index.handler`.** This is how M1.1's one-file Lambdas (`save_subscription`, `list_subscriptions`) deploy — they use only boto3 (already in the runtime), so no extra files.
 
-**Method 2 — S3 `Code.S3Bucket/S3Key` via the `flight-seed` bridge (>4096 chars or a layer zip).** When a function's code **exceeds the inline 4096-char cap**, or you need to land a **layer zip** (M2's `stripe`+`requests`) or any other bytes in S3, inline won't fit and `s3api put-object` can't take an inline body (see constraint #4). **First check your connector** (capability fork):
+**Method 2 — S3 `Code.S3Bucket/S3Key` via the `flight-seed` bridge (>4096 chars).** When a function's code **exceeds the inline 4096-char cap** (or you ever need to land any other bytes in S3), inline won't fit and `s3api put-object` can't take an inline body (see constraint #4). **First check your connector** (capability fork):
 
 - **`aws`-only connector (the common case):** use the **`flight-seed` bridge** below — it's the only path that works.
 - **Connector with a writable shell workdir (rare):** you *may* instead author the files there, `zip`, and `aws s3 cp` directly — but if you're unsure, use the bridge; it works in both.
@@ -96,7 +96,7 @@ So you **cannot** get a built zip to S3 by any direct path: the sandbox has the 
 >
 > And a function whose create **failed** on a bad zip is stuck `State=Failed` — `update-function-code` is blocked; **delete and recreate** it once the zip verifies.
 
-This is the standard way to land bytes in S3 from an `aws`-only connector — for both **>4096-char function zips** (e.g. M1.3's `flight-fare-notification`, whose folded HTML/text renderer is ~5–6 KB *and* mixes single+double quotes, so inline CFN is doubly impossible) and the **M2 `stripe`+`requests` layer** (`publish-layer-version --content S3Bucket=…,S3Key=…` after seeding `layer.zip`). Note most M1.x functions **fold into a single `index.py`** (boto3/stdlib only, no layer); the reason to use S3 is the **size cap** + the ETag-verifiable artifact, not file count.
+This is the standard way to land bytes in S3 from an `aws`-only connector — for **>4096-char function zips** (e.g. M1.3's `flight-fare-notification`, whose folded HTML/text renderer is ~5–6 KB *and* mixes single+double quotes, so inline CFN is doubly impossible). Note most functions **fold into a single `index.py`** (boto3/stdlib only, **no layer** anywhere in this course — see Rule 6); the reason to use S3 is the **size cap** + the ETag-verifiable artifact, not file count.
 
 ---
 
@@ -122,15 +122,15 @@ This is the standard way to land bytes in S3 from an `aws`-only connector — fo
 |---|---|---|---|
 | `flight/travelpayouts` | `{"token":"…"}` | M1.1 | **Lambda runtime** (parser) |
 | `flight/resend` | `{"api_key":"…","from":"…"}` | M1.3 | **Lambda runtime** (fare-notification) |
-| `flight/stripe` | `{"secret_key":"…","webhook_signing_secret":"…","price_id":"…"}` | M2 | **Lambda runtime** (webhook) |
+| `flight/ecpay` | `{"merchant_id":"…","hash_key":"…","hash_iv":"…","env":"stage|prod","amount":"…"}` | M2 | **Lambda runtime** (checkout + callbacks + cancel) |
 | `flight/telegram` | `{"bot_token":"…"}` | M4 | **Lambda runtime** (chat) |
 | `flight/anthropic` | `{"api_key":"sk-ant-…"}` | M4 | **Lambda runtime** (chat) |
 | `flight/github` | `{"pat":"github_pat_…"}` | M1.1 prereq | **session bootstrap** — the Cowork git tool, to push |
-| `flight/supabase` | `{"url":"…","anon_key":"…"}` | M0 | **session recall** — the front-end build env (anon key is **public by design**) |
+| `flight/supabase` | `{"url":"…","publishable_key":"…"}` | M0 | **session recall** — the front-end build env (publishable key is **public by design**) |
 
 **Two kinds of secret, treated the same way for storage but not for sensitivity:**
-- **Runtime-read** (travelpayouts/resend/stripe/telegram/anthropic) — a Lambda does `get_secret_value` at runtime; these are real secrets that must never reach the browser.
-- **Convenience-cache** (github/supabase) — stored so a new session recalls them without you re-finding them. The **GitHub PAT is a real write-credential** (treat it like a password; scope it to Contents:RW on the one repo). The **Supabase `anon_key` is public by design** (it ships to the browser in `VITE_SUPABASE_PUBLISHABLE_KEY`) — caching it is for convenience, not secrecy.
+- **Runtime-read** (travelpayouts/resend/ecpay/telegram/anthropic) — a Lambda does `get_secret_value` at runtime; these are real secrets that must never reach the browser. (For `flight/ecpay`: the `merchant_id` is not secret but the `hash_key`/`hash_iv` are — keep the whole object server-side.)
+- **Convenience-cache** (github/supabase) — stored so a new session recalls them without you re-finding them. The **GitHub PAT is a real write-credential** (treat it like a password; scope it to Contents:RW on the one repo). The **Supabase `publishable_key` is public by design** (it ships to the browser in `VITE_SUPABASE_PUBLISHABLE_KEY`) — caching it is for convenience, not secrecy. **Never** cache the Supabase **service-role** key.
 
 **Why:** Every other home for a *write* key has a leak story — committed `.env` is indexed by GitHub's secret scanner instantly; a write key in client JS is visible in every visitor's network tab. Secrets Manager is KMS-encrypted, IAM-scoped, and `GetSecretValue` is CloudTrail-logged. And **DynamoDB/SQS/S3 need NO secret at all** — the Lambda's IAM role authorizes them.
 
@@ -145,7 +145,7 @@ aws secretsmanager create-secret --name flight/resend --secret-string '{"api_key
 - To **update** an existing secret, `put-secret-value` (replaces the whole value — include every field).
 - Scope the role's `secretsmanager:GetSecretValue` to `arn:aws:secretsmanager:us-east-1:<ACCOUNT_ID>:secret:flight/*` — **never** `Resource: "*"`.
 - **Chat-retention caveat:** a key briefly appears in the transcript on its way to `create-secret`. Because it's now stored **once** (not re-pasted every session), there's far less exposure — but still rotate at course end. For real production, type values in the console.
-- M3 go-live check greps the deployed front-end for `AKIA…` / `service_role` / any *write* secret → must be absent (the Supabase `anon_key` is allowed there — it's public).
+- M3 go-live check greps the deployed front-end for `AKIA…` / `service_role` / any *write* secret → must be absent (the Supabase `publishable_key` is allowed there — it's public).
 
 ---
 
@@ -162,22 +162,22 @@ aws secretsmanager create-secret --name flight/resend --secret-string '{"api_key
 
 ---
 
-### Rule 4 — The Stripe webhook must verify the signature on the RAW body — decode `isBase64Encoded` first (M2)
+### Rule 4 — The ECPay callbacks must verify CheckMacValue on the decoded FORM body — and keep empty-string fields (M2)
 
-> **The rule:** In `subscription_webhook`, read the **raw** request body exactly as bytes before calling `stripe.Webhook.construct_event`. API Gateway HTTP API v2 may deliver the body **base64-encoded** (`event["isBase64Encoded"] == True`) — decode it first. Never `json.loads` then re-serialize before verifying.
+> **The rule:** In `flight-ecpay-return` / `flight-ecpay-period`, the body is **`application/x-www-form-urlencoded`, not JSON**. API Gateway HTTP API v2 may deliver it **base64-encoded** (`event["isBase64Encoded"] == True`) — decode to bytes, then `urllib.parse.parse_qs`. Recompute the CheckMacValue over the returned fields and compare. **Keep empty-string fields** (`CustomField3=`, `CustomField4=`) in the hash — drop only `CheckMacValue` itself.
 
-**Why:** Stripe signs the exact bytes it sent. Any re-encoding — base64 left undecoded, or a JSON round-trip that reorders keys / changes whitespace — changes the bytes, so the computed signature won't match and **every webhook 400s** with `SignatureVerificationError`. This is the single highest-risk file in the whole course; a wrong body handling here means payments "succeed" in Stripe but never activate the subscription.
+**Why:** ECPay signs the exact field set it sent, **including empty CustomFields**. If you filter out `v == ""` before hashing (the single most common ECPay bug), you hash a different string and **every real callback fails verification** — the symptom looks like "ECPay isn't calling me" when you're actually rejecting a valid call. (Likewise, `json.loads`-ing a form body just yields garbage.) These are the highest-risk files in M2; wrong handling here means payments "succeed" at ECPay but never activate the subscription. See [[ecpay-best-practice]] Rule 2 for the full CMV algorithm.
 
 **How to apply:**
 ```python
+import base64, urllib.parse, hashlib
 raw = event["body"]
 if event.get("isBase64Encoded"):
-    raw = base64.b64decode(raw)            # bytes
-elif isinstance(raw, str):
-    raw = raw.encode("utf-8")
-stripe.Webhook.construct_event(raw, headers["stripe-signature"], signing_secret)
+    raw = base64.b64decode(raw).decode("utf-8")
+params = {k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}  # keep_blank!
+# recompute CMV over params (KEEP "" values; drop only CheckMacValue) → compare → then RtnCode=="1"
 ```
-Test with `stripe listen --forward-to <api>/stripe-webhook` + `stripe trigger checkout.session.completed`; a `400` almost always = body handling, not the secret.
+There's **no `stripe listen` equivalent** — ECPay needs a public URL. Test via the stage 後台「模擬付款」 button or a real test-card run (see [[ecpay-best-practice]] Rules 7–8). A CMV mismatch is almost always the empty-field bug or a trailing-newline in a signed URL, not the keys.
 
 ---
 
@@ -195,29 +195,29 @@ Test with `stripe listen --forward-to <api>/stripe-webhook` + `stripe trigger ch
 
 ---
 
-### Rule 6 — Don't bundle boto3; DO bundle the stdlib helpers. Build the layer pure-Python.
+### Rule 6 — Don't bundle boto3; DO bundle the stdlib helpers. This stack needs NO dependency layer.
 
-> **The rule:** The Lambda runtime already includes **boto3** — never add it to the zip or layer. The shared layer `flight-deps` is **`stripe` + `requests`** only (both pure-Python). Stdlib-only project files (`travelpayouts.py`, `email_render.py`) are **copied into the function zip** at build, not layered.
+> **The rule:** The Lambda runtime already includes **boto3** — never add it to the zip or layer. Everything else this course needs is **stdlib**: `travelpayouts.py` + `email_render.py` (copied into the function zip, not layered), and the ECPay CheckMacValue (`hashlib`) + the cancel POST (`urllib`). So there is **no `flight-deps` layer at all** — M2 does not add one.
 
-**Why:** Bundling boto3 bloats the zip and can shadow the runtime's version with a subtly different one → confusing `botocore` errors. Putting a **C-extension** library in a Mac-built zip/layer fails at runtime on Lambda's Linux (`invalid ELF header` / `cannot import name ...`); `stripe`/`requests` are pure-Python so a Mac-built zip works. `travelpayouts.py` and `email_render.py` are stdlib-only by design, so a plain `cp` into the function dir is all that's needed.
+**Why:** Bundling boto3 bloats the zip and can shadow the runtime's version with a subtly different one → confusing `botocore` errors. The old plan shipped a `stripe`+`requests` layer for the Stripe webhook; **ECPay removes that need** — CMV is `hashlib.sha256`, the form is built as plain strings, the cancel call is `urllib.request`. Staying layer-free means no `--platform manylinux` cross-build headaches and a smaller, faster cold start. `travelpayouts.py` and `email_render.py` are stdlib-only by design, so a plain `cp` into the function dir is all that's needed.
 
 **How to apply (CLI mode):**
-- `03_build_layer.sh`: `pip install stripe requests -t python/` → zip → `publish-layer-version`. Nothing else.
-- `04_deploy_lambdas.sh`: `cp flightproxy/travelpayouts.py aws/parser/` and `cp flightproxy/email_render.py aws/fare_notification/` before zipping each function.
-- If you ever need a C-extension dep later, build it with `--platform manylinux2014_x86_64` (or Docker), not on the Mac directly.
+- **No `03_build_layer.sh` step** — skip it; there's no layer to publish. (If a leftover script references `flight-deps`, delete it.)
+- `04_deploy_lambdas.sh`: `cp flightproxy/travelpayouts.py aws/parser/` and `cp flightproxy/email_render.py aws/fare_notification/` before zipping each function. The ECPay Lambdas (`save_subscription`, `ecpay_return`, `ecpay_period`, `cancel_subscription`) are stdlib + boto3 — nothing to copy or layer.
+- If you ever add a C-extension dep later, build it with `--platform manylinux2014_x86_64` (or Docker), not on the Mac directly.
 
 **In Cowork** the build-sandbox can't hand a zip to the MCP (see *Cowork execution constraints* above), so:
 - **Small single-file Lambdas** (M1.1's `save_subscription`, `list_subscriptions`; M1.2's `flight-seed`) deploy as **inline CFN `Code.ZipFile`** with **no layer** (they only use boto3/stdlib, in the runtime). M1.2's `parser`/`wrapper` also **fold into one `index.py` each** (inline `fetch_cheapest` + routes-read) — they need no layer either.
-- **Over the 4096-char inline cap** (a big handler, or any layer zip) → land the zip in S3 via the **`flight-seed` base64 bridge** (Method 2 above), then deploy `Code:{S3Bucket,S3Key}`. The reason here is the **size cap** (and the checklist's S3-artifact check), not file count.
-- **The `stripe`+`requests` layer** is an **M2** need, not M1.2. Seed `layer.zip` to S3 the same way, then `publish-layer-version --content S3Bucket=…,S3Key=…`.
+- **Over the 4096-char inline cap** (a big handler) → land the zip in S3 via the **`flight-seed` base64 bridge** (Method 2 above), then deploy `Code:{S3Bucket,S3Key}`. The reason here is the **size cap** (and the checklist's S3-artifact check), not file count.
+- **No dependency layer anywhere** (Rule 6) — M2's ECPay Lambdas are stdlib + boto3 (CMV via `hashlib`, cancel via `urllib`), so there's no `flight-deps` zip to seed.
 
 ---
 
 ### Rule 7 — Lambdas are NOT in a VPC — keep it that way
 
-> **The rule:** Create every Lambda with **no VPC config**. They reach the public internet (Travelpayouts, Stripe, Resend) and AWS service endpoints directly.
+> **The rule:** Create every Lambda with **no VPC config**. They reach the public internet (Travelpayouts, ECPay, Resend) and AWS service endpoints directly.
 
-**Why:** Putting a Lambda in a VPC removes its default internet route — outbound calls to `api.resend.com` / `api.stripe.com` / Travelpayouts hang and time out unless you also add a NAT gateway (extra cost + setup) or VPC endpoints for every service. For this course there's no reason to be in a VPC; staying out keeps outbound HTTPS working with zero config. (DynamoDB/SQS/S3 are reached over their public endpoints via the SDK, authorized by IAM — no VPC needed.)
+**Why:** Putting a Lambda in a VPC removes its default internet route — outbound calls to `api.resend.com` / `payment.ecpay.com.tw` / Travelpayouts hang and time out unless you also add a NAT gateway (extra cost + setup) or VPC endpoints for every service. For this course there's no reason to be in a VPC; staying out keeps outbound HTTPS working with zero config. (DynamoDB/SQS/S3 are reached over their public endpoints via the SDK, authorized by IAM — no VPC needed.)
 
 **How to apply:** Don't pass `--vpc-config` to `create-function`. If a student copied a VPC config from elsewhere and Resend calls start timing out, the VPC is the first suspect.
 
@@ -263,8 +263,8 @@ A silent "no email" is almost always: empty Travelpayouts result (skip), the ded
 
 1. **`Float types are not supported`** on `put_item` → Rule 3 (use `Decimal(str(x))`).
 2. **`Object of type Decimal is not JSON serializable`** when returning a row → Rule 3 (convert before `json.dumps`).
-3. **Stripe webhook `400` / `SignatureVerificationError`** → Rule 4 (raw body + `isBase64Encoded`), not the signing secret.
-4. **Resend/Stripe calls time out from inside a Lambda** → Rule 7 (the function is in a VPC; take it out).
+3. **ECPay callback `CheckMacValue Error` / row never activates** → Rule 4 (decode the form body + `isBase64Encoded`, KEEP empty fields), not the keys.
+4. **Resend/ECPay calls time out from inside a Lambda** → Rule 7 (the function is in a VPC; take it out).
 5. **`ResourceNotFoundException` for a resource you just created** → Rule 1 (wrong region; you're hitting a default that isn't us-east-1).
 6. **Duplicate alert emails** → SQS visibility timeout too short (Rule 5) and/or the consumer skipped the `notification_history` check.
 7. **`AccessDeniedException` on DynamoDB/SQS/S3** → the `flight-lambda-role` inline policy is missing that ARN; re-apply `scripts/iam-policy.json`.
@@ -289,6 +289,6 @@ When a student asks "shouldn't we add a DLQ / split the role / add a GSI?" → "
 ## Cross-references
 
 - [[m1-flight-price-checker]] — the whole M1 build: DynamoDB + `save_subscription`/API GW (Part 1.1), `parser_wrapper`/`parser` + EventBridge + S3 routes (Part 1.2), `fare_notification` + SQS + `notification_history` dedup (Part 1.3).
-- [[m2-stripe-subscription]] — the webhook + the raw-body signature rule (Rule 4).
-- [[stripe-best-practice]] — the application side of the same webhook.
+- [[m2-ecpay-subscription]] — the recurring checkout + the two callbacks + the cancel Lambda (Rule 4 is the callback body/CMV handling).
+- [[ecpay-best-practice]] — the application side of the same callbacks (CMV algorithm, empty-field bug, `1|OK`, SimulatePaid).
 - [[supabase-best-practice]] — why no AWS key lives in the front-end (Supabase is the only thing the browser talks to, auth-only).
