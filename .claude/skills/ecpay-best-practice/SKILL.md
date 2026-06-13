@@ -149,9 +149,11 @@ ECPay always returns CustomFields as strings, and **echoes all four even when un
 
 ### Rule 7 — Guard `SimulatePaid` — the stage 模擬付款 button must NOT grant access
 
-> **The rule:** ECPay's stage 廠商後台 has a「模擬付款」button that POSTs a fake successful result (`RtnCode=1`) **with `SimulatePaid=1`** to your `ReturnURL`. It's the fastest way to test the callback is reached — but the handler must verify the CMV, reply `1|OK`, and **NOT write `subscription_status=active`** when `SimulatePaid == "1"`. Either skip the activation write or record it to a separate test log.
+> **The rule:** ECPay's stage 廠商後台 (`vendor-stage.ecpay.com.tw`) has a「模擬付款」button that POSTs a fake successful result (`RtnCode=1`) **with `SimulatePaid=1`** to your `ReturnURL`/`PeriodReturnURL`. It's the fastest way to test a callback is reached — but the handler must verify the CMV, reply `1|OK`, and **NOT write `subscription_status=active`** when `SimulatePaid == "1"`. Either skip the activation write or record it to a separate test log.
 
 **Why:** 模擬付款 is invaluable for proving "does ECPay reach my Lambda" without a real card — but if the handler activates on it, **anyone with stage-backoffice access (or a replayed payload) gets the paid product free.** (My Site flagged this as a must-fix-before-prod gap: the handler there activated on `RtnCode==1` without checking `SimulatePaid`.)
+
+> **Where to log in (the part that trips everyone up):** the 模擬付款 button lives in the **stage** backoffice **`vendor-stage.ecpay.com.tw`** — you sign in with ECPay's **published shared test login** (a `stagetest*` account + test password from ECPay's 測試帳號 page), **NOT** with the MerchantID. **`3002607` is a MerchantID, not a login** — typing it into the 賣家帳號 field gives `帳號格式錯誤`. An order you paid via `3002607` shows up under this shared stage backoffice (mixed with other testers' orders), not in any private console — your real evidence is the callback in CloudWatch + the DynamoDB row.
 
 **How to apply:**
 ```python
@@ -186,7 +188,21 @@ Use 模擬付款 freely in stage to confirm reachability; rely on a **real stage
 **How to apply:**
 - Store `merchant_trade_no` on the `subscriptions` row at subscribe time (you need it to cancel).
 - `/cancel` Lambda: build `{MerchantID, MerchantTradeNo, Action: "Cancel", TimeStamp}` + CMV, POST it (stdlib `urllib`), then `UpdateItem expired` + enqueue cancel email.
-- There's **no Stripe Customer Portal** — the self-service 退訂 button on `/account` calls *your* `/cancel` route. (A failed recurring charge can also end the series; the `PeriodReturnURL` callback can set `expired` in that case.)
+- There's **no Stripe Customer Portal** — the self-service 退訂 button on `/account` calls *your* `/cancel` route. (A failed recurring charge can also end the series — see Rule 10.)
+- **`ReAuth` (re-authorize a failed charge) cannot be tested on the stage merchant** — only `Cancel` is testable on stage. Don't build the course around verifying `ReAuth` end-to-end.
+
+---
+
+### Rule 10 — Set `expired` on ECPay's 6-strikes termination, not the first failed charge — and use the query API as the safety net
+
+> **The rule:** A failed monthly charge does **not** mean "cancel the subscription." ECPay auto-retries: failures **1–3** → retry every 3–5 days (monitor, don't act); **4–5** → longer-interval retry (warn the customer); **6th consecutive failure → ECPay auto-terminates the contract.** Only flip the row to `expired` when ECPay signals the series has actually ended, not on a single `RtnCode != 1` on `PeriodReturnURL`. And because `PeriodReturnURL` notifies **only once per cycle**, when you miss one, **don't guess — query `QueryCreditCardPeriodInfo`** for the real authorization state.
+
+**Why:** Treating the first failed renewal as `expired` cuts off a paying customer whose card merely had a transient decline that ECPay will successfully retry days later. Conversely, never reacting means a genuinely-dead card keeps a row `active` forever. The 6-strikes rule is ECPay's actual lifecycle; mirror it. And the "notify only once" guarantee means a dropped/4xx'd period callback can leave you out of sync — the query API is the authoritative reconciliation.
+
+**How to apply:**
+- `flight-ecpay-period` on `RtnCode == "1"` → keep `active` (optionally record `last_charged_at`, `TotalSuccessTimes`). On `RtnCode != "1"` → **log a failed-attempt counter, don't expire yet**; optionally email the customer to update their card around attempt #3.
+- Treat the series as ended (→ `expired`) when ECPay's payload/Query indicates termination (the 6th failure auto-cancels), or when *you* called `Cancel` (Rule 9).
+- **Reconciliation Lambda / on-demand check:** `POST …/Cashier/QueryCreditCardPeriodInfo` with `{MerchantID, MerchantTradeNo, TimeStamp}` + CMV → returns the order's executed/successful counts and per-charge records. Use it to recover a missed `PeriodReturnURL` and to drive `expired` decisions. (Deep field reference: the official **[[ecpay]]** skill, `guides/01-payment-aio.md` 定期定額 section + `QueryPeridicTrade.php`.)
 
 ---
 
@@ -217,6 +233,9 @@ Use 模擬付款 freely in stage to confirm reachability; rely on a **real stage
 8. **`NEXT_PUBLIC`-style trailing newline in a URL env** → a `\n` in `ReturnURL`/`OrderResultURL` gets signed into the CMV and ECPay's recomputed MAC differs → CMV Error. `.strip()` any URL you build from an env var.
 9. **Different services have different HashKey/HashIV** — 金流, 電子發票, and 物流 each have their own keypair in the backoffice. M2 only uses 金流; don't mix in an invoice keypair.
 10. **Don't do slow work before `1|OK`** — `UpdateItem` + SQS `SendMessage`, then ack; the status-SQS consumer does the actual emailing.
+11. **`%26`/`%3C` in callback params need `urldecode` first** — ECPay's doc warns that any field value containing `%26`(`&`) or `%3C`(`<`) must be `urldecode`d before you use/verify it, or the call fails. `urllib.parse.parse_qs(..., keep_blank_values=True)` already decodes percent-escapes for you — just don't double-encode when recomputing the CMV.
+12. **Monthly billing-day edge case** (`PeriodType=M`) — ECPay charges on the same day-of-month as the first charge; **if that day doesn't exist in a month (e.g. the 31st), it bills on the last day of that month**. Harmless for us (amount is fixed), but know it before a customer queries "why charged on the 28th." (Our daily-`D` test path sidesteps this entirely.)
+13. **First auth must succeed or there's no schedule** — *「若第一次授權失敗,此訂單不會進入排程,需重新建立一筆訂單」*. A failed first charge yields **no** `PeriodReturnURL` ever; the row stays `pending_payment` and the user must re-subscribe. Don't expect renewals from an order whose first auth failed.
 
 ---
 

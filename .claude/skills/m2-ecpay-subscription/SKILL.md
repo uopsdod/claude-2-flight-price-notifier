@@ -107,7 +107,7 @@ Update `aws/save_subscription/handler.py` (it had **no** status in M1). It needs
 2. Build the ECPay AIO **定期定額** params and sign them:
    - `MerchantID` (from `flight/ecpay`), `MerchantTradeNo`, `MerchantTradeDate` (`yyyy/MM/dd HH:mm:ss`), `PaymentType=aio`, `ChoosePayment=Credit`, `EncryptType=1`
    - `TotalAmount=<amount>` **and** `PeriodAmount=<amount>` — **they must be equal** (ECPay rule)
-   - `PeriodType=M`, `Frequency=1`, `ExecTimes=999` (monthly; 999 ≈ "indefinite" — ECPay has no true ∞, see watch-out 6)
+   - `PeriodType=M`, `Frequency=1`, `ExecTimes=999` (monthly; 999 ≈ "indefinite" — ECPay has no true ∞, see watch-out 6). **Hard-code `M`.** ⏩ *To test the renewal callback (Step 3) without waiting a month, temporarily change this one line to `PeriodType=D, Frequency=1, ExecTimes=2` and redeploy — ECPay then runs the 2nd charge the **next day** and POSTs a real (non-`SimulatePaid`) result to `PeriodReturnURL`. Revert to `M` after.* (`ExecTimes` must be ≥ 2 — ECPay rejects 1.)
    - `ItemName`, `TradeDesc` (avoid WAF keywords like `curl`/`python` — see [[ecpay-best-practice]])
    - `ReturnURL=<api>/ecpay-return`, `PeriodReturnURL=<api>/ecpay-period`, `OrderResultURL=<site>/account?purchase=success`
    - `CustomField1=email`, `CustomField2=route` — the join key the callbacks read to find the row
@@ -116,6 +116,13 @@ Update `aws/save_subscription/handler.py` (it had **no** status in M1). It needs
 4. **Idempotency:** if the row already exists and is `active`, do NOT knock it back to `pending_payment` (preserve a paid user's status). Redeploy.
 
 **Verify before moving on:** `POST /subscribe` writes a `pending_payment` row (with a `merchant_trade_no`) AND returns HTML whose `action` is the ECPay cashier and that contains a `CheckMacValue` hidden field.
+
+> **👉 Once `save_subscription` actually pushes an order through ECPay's cashier** (i.e. you submit the returned form and pay the first period with the stage test card in Step 5), **confirm it landed at ECPay** in the stage backoffice:
+> - Log into **`https://vendor-stage.ecpay.com.tw/`** (`stagetest3` / `test1234` / 統編 `00000000` — see [[m2-ecpay-subscription-prerequisites]]).
+> - Go to **信用卡收單 → 定期定額查詢**. Filter **廠商訂單編號 = your `MerchantTradeNo`** (keep 狀態 / 週期種類 / 最新授權結果 = 全部; date range covers today) → 查詢.
+> - Your recurring order appears with its 週期 + 已授權次數. (Per-period charge detail: **信用卡收單 → 交易明細查詢**, 交易類型 = 定期定額.)
+> - **The page is empty until a real order exists** — it's a results page, so it'll be blank if you've only built `save_subscription` but not yet paid through the cashier. That's expected. It's also a **shared** backoffice (other testers' orders show too) — that's why you filter by your own `MerchantTradeNo`.
+> - This is the same order you'll press **模擬付款** on to test the `PeriodReturnURL` renewal callback (Step 3 verify).
 
 ### Step 3 — Build the two callback Lambdas (the highest-risk files)
 
@@ -151,9 +158,17 @@ for fn in flight-ecpay-return flight-ecpay-period; do
 done
 ```
 
-**Verify before moving on:** there's **no `stripe listen` equivalent** — ECPay needs a publicly reachable URL. Two ways to test the callback fires (see [[ecpay-best-practice]]):
-- **「模擬付款」** in the ECPay 廠商後台 (stage) → ECPay POSTs `RtnCode=1`/`SimulatePaid=1` to your `ReturnURL`. Fastest way to prove the Lambda is reached. *(Confirm watch-out 7 so it doesn't activate.)*
-- A **real test-card** run through the live form (Step 5). Watch `aws logs tail /aws/lambda/flight-ecpay-return --since 5m --region us-east-1` for CMV-verified + `UpdateItem`.
+**Verify before moving on:** there's **no `stripe listen` equivalent** — ECPay needs a publicly reachable URL, so test against the deployed API (see [[ecpay-best-practice]] Rule 8).
+
+**(a) `ReturnURL` — the first charge (`flight-ecpay-return`):** do a **real stage test-card** run through the form (Step 5). Watch `aws logs tail /aws/lambda/flight-ecpay-return --since 5m --region us-east-1` for CMV-verified + `UpdateItem → active`.
+
+**(b) `PeriodReturnURL` — the renewal (`flight-ecpay-period`): use a daily period, verify next day (preferred — no manual backoffice step).**
+1. Temporarily set the checkout to `PeriodType=D, Frequency=1, ExecTimes=2` (Step 2) and redeploy `save_subscription`.
+2. Pay the **first** period with the test card — **it must succeed**, because *「若第一次授權失敗,此訂單不會進入排程」* (a failed first auth never enters ECPay's scheduler — you'd get no renewal at all).
+3. **The next day**, ECPay's scheduler runs the 2nd charge and POSTs a **real** result (no `SimulatePaid`) to `PeriodReturnURL`. Check `aws logs tail /aws/lambda/flight-ecpay-period --since 24h --region us-east-1` → CMV-verified, replied `1|OK`, `TotalSuccessTimes=2`.
+4. Revert to `PeriodType=M` and redeploy.
+
+> *Alternative (manual, faster but less faithful):* press **模擬付款** on the order in the stage 後台 → it POSTs `SimulatePaid=1` to `PeriodReturnURL`. This proves the Lambda is **reached + CMV-verifies + returns `1|OK`**, but because watch-out 7 makes the handler ignore `SimulatePaid`, it does **not** exercise the real renewal-bookkeeping path. The daily-period method above is the real test.
 
 ### Step 4 — Turn ON the paywall: add the `active` filter to the parser
 

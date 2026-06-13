@@ -41,6 +41,11 @@ Run each check and report. Ask for the API base URL and a test inbox. (Subscript
     --region us-east-1
   ```
   Expect `subscription_status=active`, `ecpay_gwsr` + `merchant_trade_no` set.
+- **B4** *(renewal — `PeriodReturnURL`/`flight-ecpay-period`; optional/time-gated)* To verify the renewal path the faithful way, subscribe once with a **daily** period (`PeriodType=D, Frequency=1, ExecTimes=2`) and pay the first charge **successfully** (a failed first auth never enters the scheduler). **The next day**, confirm the scheduler fired the 2nd charge into your period handler:
+  ```bash
+  aws logs tail /aws/lambda/flight-ecpay-period --since 24h --region us-east-1 | grep -iE "verified|TotalSuccessTimes|1\|OK|error"
+  ```
+  Expect CMV-verified, replied `1|OK`, `TotalSuccessTimes=2`, no `SimulatePaid`. *(Fast smoke-only alternative: 模擬付款 on the recurring order → reaches `flight-ecpay-period` with `SimulatePaid=1`; proves reachability + CMV + `1|OK` but not the real bookkeeping — see the M2 skill Step 3.)* Mark ⚠️ "pending next-day check" if you ran the checklist same-day.
 
 ### Section C — Status-change email (one consumer, routed by event_type)
 - **C0** The status queue + its single consumer exist: `aws sqs get-queue-url --queue-name flight-status-queue --region us-east-1` and `aws lambda get-function --function-name flight-status-notification --region us-east-1 --query 'Configuration.FunctionName'`.
@@ -77,6 +82,7 @@ Run each check and report. Ask for the API base URL and a test inbox. (Subscript
 | B1 both callback Lambdas | ✅/❌ | return + period |
 | B2 CMV verified + SimulatePaid guarded | ✅/❌ | the fiddly one |
 | B3 payment → active | ✅/❌ | the key one |
+| B4 renewal → PeriodReturnURL (daily test) | ✅/❌/⚠️ | ⚠️ if next-day check pending |
 | C0 status queue + 1 consumer | ✅/❌ | |
 | C1 welcome email sent | ✅/❌ | event_type routing |
 | D0 parser filters on active (Step 4) | ✅/❌ | the gate itself |
