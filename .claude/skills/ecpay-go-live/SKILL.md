@@ -187,7 +187,7 @@ Applying is free. Production introduces ECPay's **per-transaction fee** (信用�
 ## Cross-references
 
 - [[m2-ecpay-subscription]] — the stage recurring subscription this flips to production.
-- [[m3-custom-domain-go-live]] — the custom domain the callbacks point at.
+- [[m3-domain]] — the custom domain the callbacks point at.
 - [[ecpay-best-practice]] — the callback hard rules (CMV, empty-field, `1|OK`, two callbacks, SimulatePaid, cancel-is-an-API-call).
 - [[aws-best-practice]] — `flight/ecpay` lives in Secrets Manager; the form-body handling from the AWS side.
 - ECPay 申請正式金流: https://www.ecpay.com.tw/ · 廠商後台: https://vendor.ecpay.com.tw/ · 信用卡定期定額: https://developers.ecpay.com.tw/?p=2868

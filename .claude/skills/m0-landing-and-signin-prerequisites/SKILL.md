@@ -24,7 +24,7 @@ The course supports two execution environments. Confirm which one the student is
 
 Installs/logs in the CLIs (`gh`, `vercel`, `supabase`) and configures the MCP servers (Vercel, Supabase) that the M0 build (`m0-landing-and-signin`) and verification (`-checklist`) skills need.
 
-**Run this ONCE before M0.** M1.1+ reuse the same tools, so it doesn't need re-running between milestones — except later milestones add their OWN prerequisites (M1.1 adds AWS + Travelpayouts, M2 adds Stripe, M4 adds Telegram + Anthropic), covered in those skills.
+**Run this ONCE before M0.** M1.1+ reuse the same tools, so it doesn't need re-running between milestones — except later milestones add their OWN prerequisites (M1.1 adds AWS + Travelpayouts; M2 adds a payment provider; M4 adds its own accounts), covered in those skills.
 
 ## When to load this skill
 

@@ -15,7 +15,7 @@ Walks the student through Milestone 0 end-to-end. By the end the student has:
 4. A v1 landing page (`/`) for **Flight Price Notifier** with: a hero (「設定航線與目標價，機票降價就通知你」), three feature cards (盯緊熱門航線 / 達標自動通知 / 隨時取消), a top-right Sign in / 登入 button, and a footer; plus an authenticated app shell at `/app` that greets the signed-in user and shows a "dashboard coming soon" placeholder.
 5. **Auth wired up** — students can register, log in, and log out. **v1 uses Lovable's default auth backend (Lovable Cloud)** for the fastest path to a working sign-up; **Step 4 swaps it to the student's own Supabase project**. Either way **auth is the ONLY thing Supabase does** — only the default `auth.users`; no app data ever lives in Supabase (subscriptions go to DynamoDB on AWS from M1.1 on). No subscribe form, no price logic, no payments yet.
 
-**Out of scope for M0:** the subscribe UI, the DynamoDB `subscriptions` table, AWS Lambdas, the price-check loop, Resend email, Stripe. Those are M1.1 and later. (Note: Supabase never gets custom tables — all app data lives in DynamoDB on AWS.)
+**Out of scope for M0:** the subscribe UI, the DynamoDB `subscriptions` table, AWS Lambdas, the price-check loop, Resend email, and payments. Those are M1.1 and later. (Note: Supabase never gets custom tables — all app data lives in DynamoDB on AWS.)
 
 ## When to load this skill
 
@@ -197,6 +197,8 @@ v1 used **Lovable Cloud** (Lovable's managed auth). Now swap to the student's **
 
 **Verify before moving on:** sign up a brand-new test email on the **live Vercel URL** (not just the Lovable preview), then check Supabase **Authentication → Users** — the new user appears in *the student's own* project (NOT Lovable Cloud).
 
+> 📌 **Save these two values — `VITE_SUPABASE_URL` and the publishable/anon key.** You'll cache them in a `flight/supabase` Secrets Manager secret during the **M1.1 prereq** (AWS isn't set up until then), so a future Cowork session recalls them instead of you hunting them down in the Supabase dashboard again. The anon key is **public by design** (it ships in the browser bundle), so caching it is pure convenience — Supabase stays **auth-only for data**. (See [[aws-best-practice]] Rule 2.)
+
 > **Note for Claude Code:** keep the **publishable/anon key** in the front-end (correct — RLS-protected). The **service-role key is NOT used in M0** at all; it only appears later in the AWS Lambdas (M1.1+) — and even there, DynamoDB uses IAM, not a Supabase key. If the student pastes a service-role key into the front-end, stop them (see [[supabase-best-practice]] Rule 2).
 
 ### Step 5 — Final smoke test
@@ -210,7 +212,7 @@ Walk the student through: sign up → confirm email if required → sign in → 
 1. **Don't waste a generation on a blank project** — give Lovable the **full prompt + the two attached rule skills as your very first message**. A throwaway "create a blank project" prompt just burns a generation off the daily free quota.
 2. **Connecting your own Supabase too early** — do it in Step 4, after Vercel, so the swap is clean (v1 runs on Lovable Cloud).
 3. **Vercel framework preset wrong** — Lovable = Vite/React; if the build fails, fix the preset first.
-4. **Service-role key in the front-end** — never. M0 uses only the anon key.
+4. **Service-role key in the front-end** — never. M0 uses only the publishable key.
 5. **Email confirmation turned on but no SMTP** — for the demo, either disable email confirmation in Supabase Auth settings or use the magic-link flow; otherwise the test user can't finish sign-up.
 6. **Forgetting to test sign-OUT** — the loop must close; a broken sign-out hides session bugs.
 7. **Custom Supabase tables creeping in** — Supabase is auth-only, forever. App data (the `subscriptions` table) lives in DynamoDB on AWS, starting M1.1. Don't create Supabase data tables.
@@ -225,7 +227,7 @@ Walk the student through: sign up → confirm email if required → sign in → 
 
 When `m0-landing-and-signin-checklist` is green, tell the student:
 「M0 完成了！你現在有一個能註冊登入的線上網站。準備好的話跟我說『啟動 M1.1』，我們來讓使用者真的訂閱一條航線。」
-Then load `m1-1-subscribe-to-a-plan`.
+Then load `m1-flight-price-checker` (run `m1-flight-price-checker-prerequisites` first).
 
 ## Reference
 
