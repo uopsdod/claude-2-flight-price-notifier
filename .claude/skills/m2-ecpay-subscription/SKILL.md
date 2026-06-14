@@ -1,6 +1,6 @@
 ---
 name: m2-ecpay-subscription
-description: Flight Price Notifier Milestone 2 — set up an ECPay (綠界) 信用卡定期定額 monthly subscription so only paying users get alerts. An ECPay AIO recurring-payment checkout + two callback Lambdas (ReturnURL for the first charge, PeriodReturnURL for renewals) flip subscriptions pending_payment → active → expired in DynamoDB (the callbacks, verified by CheckMacValue, are the source of truth for paid status). Cancelling calls ECPay's CreditCardPeriodAction. Use when the student says "啟動 M2", "start M2", "接金流", "接綠界", "接 ECPay", "做訂閱付款", or "讓只有付費者收得到通知".
+description: Flight Price Notifier Milestone 2 — set up an ECPay (綠界) 信用卡定期定額 monthly subscription so only paying users get alerts. An ECPay AIO recurring-payment checkout + two callback Lambdas (ReturnURL for the first charge, PeriodReturnURL for renewals) drive a subscription lifecycle pending_payment → active → cancelled (grace period) → expired in DynamoDB (the callbacks, verified by CheckMacValue, are the source of truth for paid status). OrderResultURL needs a 302-redirect Lambda (a static SPA 405s on the POST). Cancelling calls ECPay's CreditCardPeriodAction but keeps service until current_period_end. Use when the student says "啟動 M2", "start M2", "接金流", "接綠界", "接 ECPay", "做訂閱付款", or "讓只有付費者收得到通知".
 ---
 
 # M2 — ECPay 定期定額（接金流，只有付費者收得到通知）
@@ -55,20 +55,23 @@ Requires M1 done (`m1-flight-price-checker-checklist` green — the free notifie
                               · 算 CheckMacValue（SHA256，stdlib hashlib — 不需 SDK / 不需 layer）
                               · 回 auto-submit HTML form ↩ 前端自動 POST 去 ECPay 收銀台
 付款（第一期，當下立即授權）
-   ├─ ReturnURL（S2S）──▶ flight-ecpay-return Lambda（paid 狀態的唯一真相來源）
+   ├─ ReturnURL（S2S，幕後）──▶ flight-ecpay-return Lambda（paid 狀態的唯一真相來源）
    │                        · 驗 CheckMacValue + MerchantID + RtnCode==1
-   │                        · active → UpdateItem DynamoDB subscriptions
+   │                        · active + 設 current_period_end → UpdateItem subscriptions
    │                        · SendMessage {event_type:"welcome",…} → [SQS status-queue]
    │                        · 回純文字 1|OK
-   └─ OrderResultURL（瀏覽器跳轉）──▶ /<site>/account?purchase=success
+   └─ OrderResultURL（瀏覽器 POST！不是 GET）──▶ flight-ecpay-result Lambda（ANY /ecpay-result）
+                            · 302 Location: <site>/app?purchase=success  ← 不可直接指向靜態 SPA（會 405）
 之後（第 2 期起，每月自動扣款）
    └─ PeriodReturnURL ──▶ flight-ecpay-period Lambda
-                           · 驗 CMV；續扣成功維持 active；ECPay 回報結束 → expired · 回 1|OK
-退訂
+                           · 驗 CMV；續扣成功 → 維持 active + 刷新 current_period_end
+                           · 連續失敗 6 次 ECPay 自動終止 → expired（非首次失敗就 expired）· 回 1|OK
+退訂（給寬限期，不是立刻 expired）
    └─ /account「取消訂閱」─POST /cancel─▶ flight-cancel-subscription Lambda
                            · POST ECPay CreditCardPeriodAction, Action=Cancel（帶原 MerchantTradeNo）
-                           · expired → UpdateItem subscriptions
+                           · status → cancelled（保留 current_period_end，期間內仍收得到）
                            · SendMessage {event_type:"cancel",…} → [SQS status-queue]
+parser 閘門：服務 active ＋ cancelled-未過期；掃到 cancelled 且 current_period_end 已過 → 懶惰改 expired
                                               │
 [SQS status-queue] ──▶ flight-status-notification Lambda（一支，依 event_type 分流）──▶ Resend
                           · "welcome" → 歡迎信   · "cancel" → 取消確認信
@@ -109,11 +112,15 @@ Update `aws/save_subscription/handler.py` (it had **no** status in M1). It needs
    - `TotalAmount=<amount>` **and** `PeriodAmount=<amount>` — **they must be equal** (ECPay rule)
    - `PeriodType=M`, `Frequency=1`, `ExecTimes=999` (monthly; 999 ≈ "indefinite" — ECPay has no true ∞, see watch-out 6). **Hard-code `M`.** ⏩ *To test the renewal callback (Step 3) without waiting a month, temporarily change this one line to `PeriodType=D, Frequency=1, ExecTimes=2` and redeploy — ECPay then runs the 2nd charge the **next day** and POSTs a real (non-`SimulatePaid`) result to `PeriodReturnURL`. Revert to `M` after.* (`ExecTimes` must be ≥ 2 — ECPay rejects 1.)
    - `ItemName`, `TradeDesc` (avoid WAF keywords like `curl`/`python` — see [[ecpay-best-practice]])
-   - `ReturnURL=<api>/ecpay-return`, `PeriodReturnURL=<api>/ecpay-period`, `OrderResultURL=<site>/account?purchase=success`
+   - `ReturnURL=<api>/ecpay-return`, `PeriodReturnURL=<api>/ecpay-period`, **`OrderResultURL=<api>/ecpay-result`** — ⚠️ **point `OrderResultURL` at a redirect Lambda, NOT the static SPA page.** ECPay delivers it as a **browser POST**; a static host returns **405** on a POST to a page route, so the user sees "This page isn't working" right after paying (the payment still succeeds via `ReturnURL`). See [[ecpay-best-practice]] Rule 11 + Step 3's `flight-ecpay-result`.
    - `CustomField1=email`, `CustomField2=route` — the join key the callbacks read to find the row
    - compute `CheckMacValue` over all of the above
-3. Return an **auto-submit HTML form** (`<form action="https://payment-stage.ecpay.com.tw/Cashier/AioCheckOut/V5" method="post">` with one hidden input per field + a tiny `<script>document.forms[0].submit()</script>`). The browser POSTs it to ECPay. (Unlike Stripe you return *HTML*, not a JSON `checkout_url`.)
+3. Return an **auto-submit HTML form** (`<form action="https://payment-stage.ecpay.com.tw/Cashier/AioCheckOut/V5" method="post">` with one hidden input per field + a trailing **`<script>document.forms[0].submit()</script>`** — use the inline script, not just `onload`, so it fires reliably after the front-end does `document.write`). The browser POSTs it to ECPay. (Unlike Stripe you return *HTML*, not a JSON `checkout_url`.)
 4. **Idempotency:** if the row already exists and is `active`, do NOT knock it back to `pending_payment` (preserve a paid user's status). Redeploy.
+
+> **Front-end contract (the part that silently breaks):** the existing M1 front-end called `res.json()` on `/subscribe` — that throws the moment the Lambda returns `text/html`, and the button does nothing. The client must branch on `Content-Type`:
+> - **`text/html`** → hand the browser to ECPay's cashier: `const html = await res.text(); document.open(); document.write(html); document.close();` (the returned form's inline `<script>…submit()</script>` then auto-POSTs to ECPay).
+> - **`application/json`** → it's an in-place update (e.g. a `cancelled`-in-grace user updating their target price — no re-payment; see the lifecycle section). Update the card without navigating.
 
 **Verify before moving on:** `POST /subscribe` writes a `pending_payment` row (with a `merchant_trade_no`) AND returns HTML whose `action` is the ECPay cashier and that contains a `CheckMacValue` hidden field.
 
@@ -132,12 +139,14 @@ ECPay posts the **first** charge result to `ReturnURL` and **every subsequent** 
 1. Read `flight/ecpay` from Secrets Manager.
 2. Parse the **form-urlencoded** body (ECPay callbacks are `application/x-www-form-urlencoded`, **not** JSON; handle `isBase64Encoded`).
 3. **Verify the CheckMacValue** over the returned fields — **keep empty-string fields in the hash** (ECPay sends `CustomField3=&CustomField4=` and signs them; dropping them gives a wrong hash — this is the single most common ECPay bug, see [[ecpay-best-practice]] Rule 2). Also verify `MerchantID` matches yours.
-4. If `RtnCode == "1"` (string!) **and** not a bare `SimulatePaid=1` test (see watch-out 7): `UpdateItem` the `subscriptions` row keyed by `{email, route}` (from `CustomField1/2`) → `subscription_status=active`, store `ecpay_gwsr` + `merchant_trade_no` for idempotency.
-5. **Idempotency:** if you've already processed this `gwsr`/`MerchantTradeNo`, skip the write but still ack.
+4. If `RtnCode == "1"` (string!) **and** not a bare `SimulatePaid=1` test (see watch-out 7): `UpdateItem` the `subscriptions` row keyed by `{email, route}` (from `CustomField1/2`) → `subscription_status=active`, store `merchant_trade_no`, and **set `current_period_end` = now + 1 period** (plus a human `current_period_end_date`) — you need this for the grace-period cancel.
+5. **Idempotency: key on `MerchantTradeNo` + "is the row already `active`?", NOT on `gwsr`.** ⚠️ `Gwsr` came back **empty** on the real 定期定額 first-period callback (field naming differs from one-time AIO — verified live). If already activated for this trade-no, skip the write but still ack. (See [[ecpay-best-practice]] Rule 4.)
 6. **Enqueue `{event_type:"welcome", email, route}` to the status SQS queue** (don't email inline — the single `flight-status-notification` consumer branches on `event_type`).
 7. **Reply with the plain-text string `1|OK`, HTTP 200** (any other body → ECPay resends 4×). On a permanent failure (CMV invalid / merchant mismatch) reply `0|<reason>`.
 
-**`aws/ecpay_period/handler.py`** (`POST /ecpay-period` — 2nd charge onward): same verify; on success keep `active` (optionally bump a `last_charged_at`); if ECPay's payload indicates the recurring series has ended, set `expired`. Reply `1|OK`.
+**`aws/ecpay_period/handler.py`** (`POST /ecpay-period` — 2nd charge onward): same verify; on `RtnCode=="1"` keep `active` and **refresh `current_period_end`** (extend by one period — this is what makes the grace-period math work over time). On failure, **don't expire on the first miss** — ECPay auto-retries and only auto-terminates after **6 consecutive failures**; set `expired` only when the series has actually ended (see [[ecpay-best-practice]] Rule 10). Reply `1|OK`.
+
+**`aws/ecpay_result/handler.py`** (`ANY /ecpay-result` — the browser-return redirect; **fixes the 405**): ECPay delivers `OrderResultURL` as a **browser POST**, and a static SPA returns **405** on a POST to a page route — so this tiny Lambda exists only to turn that POST into a redirect. It does **no** auth/activation (that's `ReturnURL`'s job). Read `RtnCode` from the POST body if you want success/fail branching, then return **`{"statusCode":302,"headers":{"Location":"https://<site>/app?purchase=success"}}`**. (See [[ecpay-best-practice]] Rule 11.)
 
 Create the **status queue + its consumer** (mirrors the fare-queue pattern from M1.3) and the two routes:
 ```bash
@@ -147,9 +156,13 @@ aws sqs create-queue --queue-name flight-status-queue --region us-east-1
 #   ("welcome"|"cancel") and renders/sends the matching email via Resend. Don't build two.
 # extend flight-lambda-role: sqs SendMessage (return/period/cancel Lambdas) + Receive/Delete (consumer) on flight-status-queue
 
-# integrations + routes 'POST /ecpay-return' and 'POST /ecpay-period' on the existing flight-api
-for fn in flight-ecpay-return flight-ecpay-period; do
-  route=${fn#flight-}   # ecpay-return / ecpay-period
+# routes on the existing flight-api:
+#   POST /ecpay-return  → flight-ecpay-return    (S2S, source of truth)
+#   POST /ecpay-period  → flight-ecpay-period    (renewals)
+#   ANY  /ecpay-result  → flight-ecpay-result    (browser POST → 302 redirect; fixes the 405)
+#   POST /cancel        → flight-cancel-subscription (Step 6)
+for fn in flight-ecpay-return flight-ecpay-period flight-ecpay-result; do
+  route=${fn#flight-}   # ecpay-return / ecpay-period / ecpay-result
   aws lambda add-permission --function-name $fn \
     --statement-id apigw-$route --action lambda:InvokeFunction \
     --principal apigateway.amazonaws.com \
@@ -170,13 +183,18 @@ done
 
 > *Alternative (manual, faster but less faithful):* press **模擬付款** on the order in the stage 後台 → it POSTs `SimulatePaid=1` to `PeriodReturnURL`. This proves the Lambda is **reached + CMV-verifies + returns `1|OK`**, but because watch-out 7 makes the handler ignore `SimulatePaid`, it does **not** exercise the real renewal-bookkeeping path. The daily-period method above is the real test.
 
-### Step 4 — Turn ON the paywall: add the `active` filter to the parser
+### Step 4 — Turn ON the paywall: add the grace-aware gate to the parser
 
-This is the step that actually gates alerts. Edit `aws/parser/handler.py` (from M1.2): change the subscription `Scan`'s `FilterExpression` from `route = :r` to **`route = :r AND subscription_status = :active`** (`:active = "active"`). Redeploy the parser.
+This is the step that actually gates alerts — and it's **not** a plain `status == active` filter, because cancellation grants a grace period (Step 6). Edit `aws/parser/handler.py` (from M1.2) so a row is served if:
 
-Now: `pending_payment` and `expired` rows are skipped; only paid (`active`) subscribers are enqueued to the fare queue and emailed. (Old M1 rows that have no `subscription_status` at all also stop matching — re-subscribe + pay to make them `active`, which is the intended paid behavior.)
+- `subscription_status == "active"`, **OR**
+- `subscription_status == "cancelled"` **AND** `current_period_end >= now` (still paid-through — keep alerting).
 
-**Verify before moving on:** invoke the parser with a `pending_payment` row whose target is met → it is NOT enqueued (the guard works). Flip that row to `active` and re-invoke → it IS enqueued.
+And because the parser scans every row anyway, make it the place that **lazily retires** grace-expired rows: when it sees a `cancelled` row whose `current_period_end < now`, `UpdateItem` it → `expired`. (`pending_payment`/`expired` are never served.) Redeploy the parser. See [[ecpay-best-practice]] Rule 12.
+
+Now: only paid (`active`) and cancelled-but-still-in-period subscribers are enqueued. (Old M1 rows that have no `subscription_status` at all also stop matching — re-subscribe + pay to make them `active`.)
+
+**Verify before moving on:** a `pending_payment` row whose target is met is NOT enqueued; an `active` row IS; a `cancelled` row with a **future** `current_period_end` IS (grace); and a `cancelled` row with a **past** `current_period_end` gets flipped to `expired` and is NOT enqueued.
 
 ### Step 5 — Test a real recurring payment end-to-end
 
@@ -188,21 +206,41 @@ aws dynamodb get-item --table-name subscriptions \
   --key '{"email":{"S":"<payer>"},"route":{"S":"TPE-TYO"}}' \
   --region us-east-1
 ```
-Shows `subscription_status=active`, `ecpay_gwsr` + `merchant_trade_no` set. Then invoke the parser → the now-active row is enqueued and emailed (if at/below target). A `pending_payment` payer is NOT.
+Shows `subscription_status=active`, `merchant_trade_no` + `current_period_end` set. Then invoke the parser → the now-active row is enqueued and emailed (if at/below target). A `pending_payment` payer is NOT. (Note: `OrderResultURL` lands the browser via the `flight-ecpay-result` redirect — if you instead see a **405** right after paying, your `OrderResultURL` is pointing at the static SPA; fix per Step 2 / [[ecpay-best-practice]] Rule 11. The payment still succeeded.)
 
 ### Step 6 — Build + test cancellation (an API call, not an event)
 
-Unlike Stripe (where a dashboard cancel *fires* `customer.subscription.deleted`), ECPay cancellation is something **you call**. Build `aws/cancel_subscription/handler.py` (`POST /cancel`):
+Unlike Stripe (where a dashboard cancel *fires* `customer.subscription.deleted`), ECPay cancellation is something **you call** — and it grants a **grace period**, it does NOT expire instantly. Build `aws/cancel_subscription/handler.py` (`POST /cancel`):
 1. Look up the row's stored `merchant_trade_no`.
-2. `POST` to `https://payment-stage.ecpay.com.tw/Cashier/CreditCardPeriodAction` with `MerchantID`, `MerchantTradeNo`, `Action=Cancel`, `TimeStamp`, and a `CheckMacValue` over them.
-3. `UpdateItem` the row → `subscription_status=expired`; enqueue `{event_type:"cancel", email, route}` to the **same** `flight-status-queue` (the one `flight-status-notification` consumer sends the cancel email).
+2. `POST` to `https://payment-stage.ecpay.com.tw/Cashier/CreditCardPeriodAction` with `MerchantID`, `MerchantTradeNo`, `Action=Cancel`, `TimeStamp`, and a `CheckMacValue` over them. *(Stage cancel of a never-paid synthetic order returns `90100150 不存在的訂單編號` — that's expected; **log it and still cancel locally**.)*
+3. `UpdateItem` the row → **`subscription_status=cancelled`** (a transition state — **NOT `expired`**), **keep `current_period_end`** so the parser keeps serving them until the period lapses. **Migration fallback:** if the row has no `current_period_end` (activated before period-tracking existed), set it to **`now + 1 month`** so the parser doesn't expire them on its next run.
+4. Enqueue `{event_type:"cancel", email, route}` to the **same** `flight-status-queue` (the one `flight-status-notification` consumer sends the cancel email).
+
+> **A `cancelled`-in-grace user can still update their target price** — that's an in-place `/subscribe` update (JSON response, no re-payment, status stays `cancelled`); their watch is live until the period ends.
 
 Wire a 「取消訂閱」 button on `/account` to `POST /cancel`. Then test:
 ```bash
 curl -s -X POST "<api>/cancel" -H "content-type: application/json" \
   -d '{"email":"<payer>","route":"TPE-TYO"}'
 ```
-**Verify:** the row flips to `expired`; the parser no longer enqueues it (alerts stop). In the ECPay 廠商後台 → 信用卡定期定額訂單查詢, the order shows terminated.
+**Verify:** the row flips to **`cancelled`** with `current_period_end` preserved; the parser **still enqueues it** (grace) until that date passes, then lazily flips it to `expired` (Step 4). In the ECPay 廠商後台 → 信用卡定期定額訂單查詢, the order shows terminated (no more renewals). See the lifecycle diagram in [[ecpay-best-practice]] Rule 9.
+
+### Step 7 — Status-aware UI + the M1→M2 migration
+
+`flight-list-subscriptions` (from M1.1) already returns the full row including `subscription_status` — but the M1 front-end **ignored it and treated any row as 已訂閱**, so an unpaid `pending_payment` row wrongly showed as subscribed. Make the cards **status-aware**:
+
+| `subscription_status` | Card shows |
+|---|---|
+| `active` | 已訂閱 (有效) |
+| `pending_payment` | 未完成付款 + a **「完成付款 / Pay」** button (re-runs `/subscribe` → cashier) |
+| `cancelled` | 已取消 · **有效至 `current_period_end_date`**（仍會通知到該日） |
+| `expired` | 已結束 + a 重新訂閱 button |
+
+**Migration: keep, don't delete.** Don't delete legacy/unpaid M1 rows on the M2 cutover. Surface them as `pending_payment` with the 完成付款 reminder so users **self-migrate** by paying. (Also backfill any pre-existing `active` rows with a `current_period_end` so the grace-period math works — see Step 6.)
+
+> **Subscription lifecycle (one line to remember):** `pending_payment → active ⇄ (target updates) → cancelled (grace, still alerted) → expired`. Re-subscribe+pay goes `expired/pending_payment → active`. Full state machine: [[ecpay-best-practice]] Rule 9.
+
+> **Deploy convention (Cowork):** these Lambdas deploy as **single-file `index.handler`** via inline CloudFormation (≤4096 chars) or the **`flight-seed`/`flight-assemble` base64→S3 bridge** for bigger zips — **not** `aws/<fn>/handler.py` + `zip --zip-file fileb://` (the Cowork sandbox has no AWS network route). Any zip over ~1.5 KB MUST go chunked-with-ETag-verification — see [[aws-best-practice]] (a single long base64 `--payload` silently corrupts; only an ETag==md5 gate catches it). The live M2 sources are single-file.
 
 ## Things to watch out for
 
@@ -213,11 +251,15 @@ curl -s -X POST "<api>/cancel" -H "content-type: application/json" \
 5. **Callbacks = source of truth** — only the `flight-ecpay-return`/`flight-ecpay-period` Lambdas write `active`. `save_subscription` only writes `pending_payment`; the `OrderResultURL` browser-redirect page is UX-only and must never activate. (See [[ecpay-best-practice]] Rule 1.)
 6. **No true "indefinite" subscription** — ECPay's `ExecTimes` is a *count* (`M`: max 999). We use `ExecTimes=999` as "effectively long-term," not infinite-like-Stripe. `PeriodAmount` must equal `TotalAmount`. (See [[ecpay-best-practice]] Rule 6.)
 7. **Guard `SimulatePaid`** — the stage 後台「模擬付款」 button (great for testing the callback) sends `SimulatePaid=1`. Verify the CMV and reply `1|OK`, but **do not write `active`** for a bare simulate — else anyone hitting simulate gets the product free. (See [[ecpay-best-practice]] Rule 7.)
-8. **The gate lives in the parser, not here** — payment alone doesn't stop emails; the **parser's `active` filter (Step 4)** is what enforces it. Skip Step 4 and paying changes the status but everyone still gets emailed (M1 behavior). Both halves are required.
-9. **Cancel is *your* API call** — `CreditCardPeriodAction Action=Cancel`. There's no Stripe-style Customer Portal; the self-service 退訂 is the `/cancel` Lambda you build in Step 6.
-10. **No SDK, no layer** — CMV is `hashlib.sha256`; the cancel POST is `urllib`. So M2 **doesn't** add the `stripe`+`requests` layer (that line from the old plan is gone). Lambdas stay stdlib + boto3. (See [[aws-best-practice]].)
-11. **TWD is a whole-number currency in ECPay** — `TotalAmount=150` means NT$150. (No ×100 cents trap; that was a Stripe-TWD pitfall.) But ECPay silently hides credit-card payment for amounts below the card minimum (~NT$6–11) — don't test with NT$1.
-12. **Stage vs prod** — M2 runs entirely on the **stage** merchant + cashier URL (`payment-stage.ecpay.com.tw`). Applying for a real MerchantID + confirming 定期定額 is enabled + switching to `payment.ecpay.com.tw` is **M3** ([[ecpay-go-live]]).
+8. **The gate lives in the parser, and it's grace-aware** — payment alone doesn't stop emails; the **parser (Step 4)** enforces it, serving `active` **and** `cancelled`-in-grace, and lazily expiring grace-lapsed rows. Skip Step 4 and everyone still gets emailed (M1 behavior). (See [[ecpay-best-practice]] Rule 12.)
+9. **Cancel grants a grace period — sets `cancelled`, NOT `expired`** — `CreditCardPeriodAction Action=Cancel` stops *renewals*, but the user keeps service through `current_period_end`. Track + refresh `current_period_end` on every charge; cancel keeps it; the parser expires later. There's no Stripe Customer Portal — the self-service 退訂 is your `/cancel` Lambda. (See [[ecpay-best-practice]] Rule 9.)
+10. **`OrderResultURL` is a browser POST → 405 on a static SPA** — point it at the `flight-ecpay-result` 302-redirect Lambda, never the SPA page. A 405 right after paying is a UX bug, not a payment bug (the row still activated via `ReturnURL`). (See [[ecpay-best-practice]] Rule 11.)
+11. **Idempotency on `MerchantTradeNo`, not `gwsr`** — `Gwsr` is **empty** on the real recurring first-period callback. Key on the trade-no + "already active?" (See [[ecpay-best-practice]] Rule 4.)
+12. **Front-end must branch on `Content-Type`** — `/subscribe` returns `text/html` (→ `document.write` to ECPay) or `application/json` (→ in-place update). `res.json()` on the HTML silently breaks the button. (Step 2.)
+13. **No SDK, no layer** — CMV is `hashlib.sha256` (use the official `ecpayUrlEncode` — `~`→`%7E` — and validate against `ecpay/test-vectors/`); the cancel POST is `urllib`. Lambdas stay stdlib + boto3, single-file `index.handler`. (See [[aws-best-practice]] + [[ecpay-best-practice]] Rule 2.)
+14. **TWD is a whole-number currency in ECPay** — `TotalAmount=150` means NT$150. (No ×100 cents trap.) But ECPay silently hides credit-card payment below the card minimum (~NT$6–11) — don't test with NT$1.
+15. **Resend sandbox only reaches your own account email** — test M2's welcome/cancel emails **to yourself**; other recipients 403 until you verify a domain (M3). (See [[resend-best-practice]].)
+16. **Stage vs prod** — M2 runs entirely on the **stage** merchant + cashier URL (`payment-stage.ecpay.com.tw`). Applying for a real MerchantID + confirming 定期定額 is enabled + switching to `payment.ecpay.com.tw` is **M3** ([[ecpay-go-live]]).
 
 ## Expected duration
 

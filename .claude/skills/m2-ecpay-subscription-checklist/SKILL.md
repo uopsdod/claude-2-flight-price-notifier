@@ -51,27 +51,35 @@ Run each check and report. Ask for the API base URL and a test inbox. (Subscript
 - **C0** The status queue + its single consumer exist: `aws sqs get-queue-url --queue-name flight-status-queue --region us-east-1` and `aws lambda get-function --function-name flight-status-notification --region us-east-1 --query 'Configuration.FunctionName'`.
 - **C1** After B3, a **welcome** email arrives at the test inbox (the `flight-ecpay-return` callback enqueued `{event_type:"welcome"}` → the one `flight-status-notification` consumer sent it via Resend).
 
-### Section D — Gating works (the point of M2)
-- **D0** The parser now filters on status (Step 4 was applied) — invoking the parser for a route with a `pending_payment` row whose target is met does NOT enqueue it:
+- **B5** *(`OrderResultURL` returns 302, not 405)* The browser-return endpoint redirects instead of erroring. ECPay delivers it as a **POST**:
+  ```bash
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST "<api>/ecpay-result" -d "RtnCode=1"
+  ```
+  Expect **`302`** (Location → `/app?purchase=success`), **NOT `405`**. A 405 means `OrderResultURL` points at the static SPA (Rule 11) — the payment still works but the UX is broken.
+
+### Section D — Gating works, grace-aware (the point of M2)
+- **D0** The parser gate (Step 4) is **grace-aware**, not plain `active` — invoking the parser for a route with a `pending_payment` row whose target is met does NOT enqueue it:
   ```bash
   aws lambda invoke --function-name flight-parser \
     --payload '{"origin":"TPE","destination":"TYO","route":"TPE-TYO"}' /tmp/p.json \
     --region us-east-1
-  aws logs tail /aws/lambda/flight-parser --since 3m --region us-east-1 | grep -iE "active|skip|enqueue"
+  aws logs tail /aws/lambda/flight-parser --since 3m --region us-east-1 | grep -iE "active|cancelled|skip|enqueue|expired"
   ```
 - **D1** The now-`active` row (target above live fare) **is** enqueued + emailed when the parser runs → fare email arrives.
 - **D2** A `pending_payment` (unpaid) row is NOT enqueued/emailed. Confirms payment gates alerts.
+- **D3** A `cancelled` row with a **future** `current_period_end` **IS** still enqueued (grace). A `cancelled` row with a **past** `current_period_end` is NOT, and the parser flips it to `expired` on that run.
 
-### Section E — Cancellation (an API call you make)
-- **E1** The cancel Lambda exists and `POST /cancel` calls `CreditCardPeriodAction` and flips the row to `expired`:
+### Section E — Cancellation (an API call you make; grace, not instant expiry)
+- **E1** The cancel Lambda exists; `POST /cancel` calls `CreditCardPeriodAction` and flips the row to **`cancelled`** (NOT `expired`), preserving `current_period_end`:
   ```bash
   curl -s -X POST "<api>/cancel" -H "content-type: application/json" -d '{"email":"pay@test.com","route":"TPE-TYO"}'
   aws dynamodb get-item --table-name subscriptions \
     --key '{"email":{"S":"pay@test.com"},"route":{"S":"TPE-TYO"}}' \
-    --region us-east-1 --query 'Item.subscription_status'
+    --region us-east-1 --query 'Item.{status:subscription_status,end:current_period_end}'
   ```
-  Expect `expired`. A **cancel** email also arrives (same status consumer, `{event_type:"cancel"}`). In the 後台 → 信用卡定期定額訂單查詢, the series shows terminated.
-- **E2** The now-`expired` row is no longer enqueued/emailed on the next parser run.
+  Expect `status=cancelled` with `current_period_end` set. A **cancel** email also arrives (same status consumer, `{event_type:"cancel"}`). In the 後台 → 信用卡定期定額訂單查詢, the series shows terminated (no more renewals). *(Stage cancel of a never-paid synthetic order returns `90100150 不存在的訂單編號` — expected; the Lambda should log it and still cancel locally, not treat it as a failure.)*
+- **E2** A `cancelled`-in-grace subscriber can **update their target price** in place (JSON response from `/subscribe`, no re-payment, status stays `cancelled`).
+- **E3** Lifecycle end-to-end: `pending_payment → active → cancelled (grace, still alerted) → expired` (after `current_period_end` passes, via the parser). The expired row is no longer enqueued/emailed.
 
 ## Reporting
 
@@ -81,24 +89,29 @@ Run each check and report. Ask for the API base URL and a test inbox. (Subscript
 | A2 checkout form (CMV + Period*) | ✅/❌ | |
 | B1 both callback Lambdas | ✅/❌ | return + period |
 | B2 CMV verified + SimulatePaid guarded | ✅/❌ | the fiddly one |
-| B3 payment → active | ✅/❌ | the key one |
+| B3 payment → active (+ current_period_end) | ✅/❌ | the key one |
 | B4 renewal → PeriodReturnURL (daily test) | ✅/❌/⚠️ | ⚠️ if next-day check pending |
+| B5 OrderResultURL → 302 not 405 | ✅/❌ | the 405-after-paying bug |
 | C0 status queue + 1 consumer | ✅/❌ | |
 | C1 welcome email sent | ✅/❌ | event_type routing |
-| D0 parser filters on active (Step 4) | ✅/❌ | the gate itself |
+| D0 parser gate grace-aware (Step 4) | ✅/❌ | the gate itself |
 | D1 active → emailed | ✅/❌ | |
 | D2 pending_payment → not emailed | ✅/❌ | gating proof |
-| E1 cancel → expired (+ cancel email) | ✅/❌ | API call, not event |
-| E2 expired → not emailed | ✅/❌ | |
+| D3 cancelled-in-grace emailed; grace-expired flipped | ✅/❌ | grace period |
+| E1 cancel → cancelled (NOT expired) + email | ✅/❌ | API call, grace not instant |
+| E2 cancelled-in-grace can update target | ✅/❌ | in-place, no re-pay |
+| E3 lifecycle → expired after period passes | ✅/❌ | parser lazily expires |
 
 **Verdict:**
 - All ✅ → 「M2 驗收通過 ✅ 產品會賺錢了，只有付費者收得到通知。READY for M3。跟我說『啟動 M3』來掛自己的網域、正式開張。」
 - Any ❌ → name failures + recovery:
-  - CMV reject / callback "never arrives" but 後台 shows paid → you're **dropping empty-string fields** before hashing; keep `CustomField3=`/`CustomField4=` ([[ecpay-best-practice]] Rule 2).
-  - not flipping → check `CustomField1/2` (email+route) + `UpdateItem` + IAM DynamoDB perms; only the callbacks write `active`.
+  - CMV reject / callback "never arrives" but 後台 shows paid → you're **dropping empty-string fields** before hashing; keep `CustomField3=`/`CustomField4=` ([[ecpay-best-practice]] Rule 2). For a `~` in any value, you may be using the buggy `ecpayUrlEncode` — validate against `ecpay/test-vectors/checkmacvalue.json` (Rule 2).
+  - not flipping → check `CustomField1/2` (email+route) + `UpdateItem` + IAM DynamoDB perms; idempotency on **`MerchantTradeNo` not `gwsr`** (`gwsr` is empty on recurring — Rule 4).
+  - **405 right after paying** → `OrderResultURL` points at the static SPA; add the `flight-ecpay-result` 302 Lambda (Rule 11). Payment still succeeded.
   - renewals don't update → you only built `ReturnURL`; add the `PeriodReturnURL` handler ([[ecpay-best-practice]] Rule 1/9).
+  - **cancel expires instantly instead of granting grace** → cancel must set `cancelled` + keep `current_period_end`, and the parser serves `cancelled`-in-grace + lazily expires (Rules 9, 12). Don't set `expired` in the cancel Lambda.
   - 模擬付款 grants free access → guard `SimulatePaid` (Rule 7).
-  - gating wrong → confirm the **parser's** Scan filter now includes `subscription_status = active` (Step 4) — payment without the filter still emails everyone.
-  - cancel does nothing → cancel is `CreditCardPeriodAction Action=Cancel` that **you** call, not an event you wait for (Rule 9).
+  - cancel does nothing → cancel is `CreditCardPeriodAction Action=Cancel` that **you** call, not an event you wait for (Rule 9). `90100150` on a never-paid order is expected.
+  - emails not arriving → Resend sandbox only reaches your own account email (verify a domain at M3).
   
   then re-run `驗收 M2`.

@@ -76,6 +76,11 @@ aws lambda get-function --function-name flight-save-subscription --region us-eas
 ```
 If any are missing, finish the corresponding earlier milestone first.
 
+## Heads-up — two things that look like failures but aren't
+
+- **Resend sandbox only delivers to YOUR OWN address.** While `flight/resend` sends from `onboarding@resend.dev` (pre-M3), welcome/cancel/fare emails reach **only the Resend account's own verified email**; any other recipient `403`s `validation_error`. So test M2's emails **to yourself** — it's not broken, it's the sandbox. Real delivery to anyone needs a **verified sending domain** (M3 / [[resend-best-practice]]).
+- **`OrderResultURL` needs a redirect Lambda, or you get a 405 right after paying.** ECPay returns the browser via a **POST**; a static SPA (Vercel/Netlify) only serves GET on a page route → **405 "This page isn't working"** (the payment still succeeded via the S2S `ReturnURL`). M2 Step 2/3 builds a tiny `flight-ecpay-result` 302-redirect Lambda for `OrderResultURL` — know this symptom up front. (See [[ecpay-best-practice]] Rule 11.)
+
 ## Verify (all must pass)
 
 - `flight/ecpay` secret exists with stage `merchant_id` + your `amount` ✅
