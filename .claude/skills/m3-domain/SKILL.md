@@ -20,6 +20,15 @@ Why this matters: 有了自己的網域，才是真正屬於你的產品 — 才
 
 End state of this skill: the Vercel domain + the Resend sending domain are **set up** (records added, secret flipped). You then **verify** with the checklist.
 
+## Architecture (where M3 fits)
+
+![Flight Notification architecture — the Product Site now serves on your own [domain].com; ECPay Lambda Handlers run the callbacks; emails go out via Resend](assets/flight-notification-architecture.jpg)
+
+M3 changes only the **outer edges** of this diagram, not the flow:
+- **`[domain].com` Product Site** (top-left) — Step 2 binds your custom domain to the Vercel-hosted front-end (instead of `*.vercel.app`).
+- **Email [Resend]** (right) — Step 3 makes both the *Subscription Status Notification* and *Flight Fare Notification* emails send **from your domain** (`alerts@…`), lifting the M2 sandbox limit.
+- Everything in between is **unchanged**: the **ECPay Lambda Handlers** (`flight-ecpay-return` / `-period` / `-cancel-subscription`), the `subscription check`, the SQS fan-out, the parser, and `Notification History` all keep running exactly as M2 built them. M3 touches no Lambda code and no payment path.
+
 ## When to load this skill
 
 - "啟動 M3" / "start M3" / "綁網域" / "上線" / "go live" / "正式開張"
