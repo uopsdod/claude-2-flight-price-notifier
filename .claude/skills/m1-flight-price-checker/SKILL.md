@@ -17,9 +17,9 @@ Build the complete **free** notifier in one pass: **subscribe → fetch on a sch
 
 **End state:** pick a plan + budget on the live site → a row appears in DynamoDB (and the card shows you're subscribed) → the schedule fetches fares → when a watched route hits the target, a real **email** lands (NT$ headline + optional 約 US$, 「立即訂購」 button), with **no duplicate spam** and **no payment required**.
 
-> **NO payment guard in M1.** A subscription row's mere existence = eligible for alerts. There is **no `subscription_status`** field anywhere in M1 — it, the ECPay payment callbacks, and the `active`-only parser filter are all **introduced in M2** (the paywall). Don't add a status here.
+> **NO payment guard in M1.** A subscription row's mere existence = eligible for alerts. There is **no `subscription_status`** field anywhere in M1 — it, the payment-confirmation flow, and the `active`-only parser filter are all **introduced in M2** (the paywall). Don't add a status here.
 >
-> **Architecture invariants:** Supabase = **auth only** (the M0 login); all app data lives in **DynamoDB on AWS**. The join key across Supabase-auth / DynamoDB / ECPay is the user's **email**. The browser holds **no AWS credentials** — it POSTs to API Gateway; only Lambdas touch AWS (via the shared IAM role). **Why email, not SMS:** US SMS needs A2P 10DLC carrier registration (10–15 days, paid) — Resend emails any inbox immediately.
+> **Architecture invariants:** Supabase = **auth only** (the M0 login); all app data lives in **DynamoDB on AWS**. The join key across Supabase-auth / DynamoDB / the payment provider is the user's **email**. The browser holds **no AWS credentials** — it POSTs to API Gateway; only Lambdas touch AWS (via the shared IAM role). **Why email, not SMS:** US SMS needs A2P 10DLC carrier registration (10–15 days, paid) — Resend emails any inbox immediately.
 
 ## When to load this skill
 
@@ -80,7 +80,7 @@ aws dynamodb create-table --table-name notification_history \
   --billing-mode PAY_PER_REQUEST --region us-east-1
 ```
 
-**`subscriptions` row shape** (schemaless — written by the handlers): `email` (PK), `route` (SK, `TPE-TYO`|`TPE-SEL`), `plan_name` (`tokyo`|`seoul`), `origin` (`TPE`), `destination` (`TYO`|`SEL`), `target_price` (N, TWD), `currency` (`TWD`), `created_at`, `updated_at`. **No `subscription_status`/`merchant_trade_no`/`ecpay_*` in M1.** **`notification_history`**: `pk` (S, `"{email}#{route}"`), `sent_at` (S, ISO-8601 UTC) — Part 1.3's dedup target.
+**`subscriptions` row shape** (schemaless — written by the handlers): `email` (PK), `route` (SK, `TPE-TYO`|`TPE-SEL`), `plan_name` (`tokyo`|`seoul`), `origin` (`TPE`), `destination` (`TYO`|`SEL`), `target_price` (N, TWD), `currency` (`TWD`), `created_at`, `updated_at`. **No `subscription_status` or any payment-related fields in M1** (those arrive with the M2 paywall). **`notification_history`**: `pk` (S, `"{email}#{route}"`), `sent_at` (S, ISO-8601 UTC) — Part 1.3's dedup target.
 
 **The two fixed plans** (seeded in the UI + known to the Lambda — no separate table):
 
@@ -424,7 +424,7 @@ A recent `sent_at`+`price`; the immediate re-run skipped; the big-drop wrote a n
 
 ## Things to watch out for (whole milestone)
 
-1. **No payment guard in M1** — no `subscription_status` anywhere; everyone who subscribes is eligible. The paywall (status + ECPay payment callbacks + active-only parser filter) is **M2**.
+1. **No payment guard in M1** — no `subscription_status` anywhere; everyone who subscribes is eligible. The paywall (status + payment confirmation + active-only parser filter) is **M2**.
 2. **CORS + no-AWS-creds-in-front-end** — set CORS on the HTTP API; the browser only POSTs to API Gateway; only Lambdas touch AWS (the Supabase publishable key in the front-end is fine — public, auth-only).
 3. **Decimal, not float** — `target_price`/`price` to DynamoDB as `Decimal(str(x))`; convert back for JSON ([[aws-best-practice]] Rule 3).
 4. **Deploy method by size** — 1-file ≤4096 chars → inline CFN; bigger (parser, notification) → the `flight-seed` S3 bridge, **verify by ETag==md5** (size misses a same-length corruption).
@@ -441,7 +441,7 @@ A recent `sent_at`+`price`; the immediate re-run skipped; the big-drop wrote a n
 
 ## Next step
 
-When `m1-flight-price-checker-checklist` is green: 「M1 完成！你有一個能動的*免費*降價通知器了 — 訂閱、定時抓價、達標寄信（含去重），而且還沒有付款門檻。跟我說『啟動 M2』，我們來接 ECPay 綠界金流，加上『只有付費者才收得到通知』的門檻。」Then load `m2-ecpay-subscription`.
+When `m1-flight-price-checker-checklist` is green: 「M1 完成！你有一個能動的*免費*降價通知器了 — 訂閱、定時抓價、達標寄信（含去重），而且還沒有付款門檻。跟我說『啟動 M2』，我們來接金流，加上『只有付費者才收得到通知』的門檻。」Then load `m2-ecpay-subscription`.
 
 ## Reference
 

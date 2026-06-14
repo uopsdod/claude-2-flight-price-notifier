@@ -44,6 +44,16 @@ Requires M1 done (`m1-flight-price-checker-checklist` green — the free notifie
 
 ## Architecture
 
+![Flight Notification architecture (M2) — the Vercel-hosted Product Site, the ECPay Lambda Handlers running the callbacks, the subscription check gating the parser, and emails via Resend](assets/flight-notification-architecture-m2.jpg)
+
+How the diagram maps to M2 (the boxes you build/upgrade this milestone):
+- **ECPay Lambda Handlers** (legend, bottom-left) = `flight-ecpay-return` + `flight-ecpay-period` + `flight-cancel-subscription` — the callbacks that flip `subscription_status` (verified by CheckMacValue). The bottom-right inset shows the flow: `ECPay → callback → subscriptions [W]rite`.
+- **subscription check** on the `Subscriptions [DynamoDB]` table = the parser's grace-aware gate (serves `active` + `cancelled`-in-grace) — the paywall.
+- **Subscription Status Notification** (welcome/cancel) + **Flight Fare Notification** (price-drop) both go out via **Resend**; the status one is the single `event_type`-routed consumer.
+- The **Product Site** sits on the generic **Vercel host** here — M3 ([[m3-domain]]) rebinds it to your own `[domain].com`.
+
+The detailed flow:
+
 ```
 訂閱表單 ─POST /subscribe─▶ save_subscription Lambda
                               · PutItem subscriptions（M2 起：status=pending_payment）
@@ -267,7 +277,7 @@ curl -s -X POST "<api>/cancel" -H "content-type: application/json" \
 
 ## Next step
 
-When `m2-ecpay-subscription-checklist` is green: 「M2 完成！只有付費者收得到通知，取消就停。你的產品會賺錢了。跟我說『啟動 M3』，我們把它掛到你自己的網域、正式開張。」Then load `m3-custom-domain-go-live`.
+When `m2-ecpay-subscription-checklist` is green: 「M2 完成！只有付費者收得到通知，取消就停。你的產品會賺錢了。跟我說『啟動 M3』，我們把它掛到你自己的網域、正式開張。」Then load `m3-domain`.
 
 ## Reference
 
