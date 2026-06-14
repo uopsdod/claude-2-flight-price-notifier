@@ -47,6 +47,7 @@ Auth-only means almost no Supabase tooling is needed — mostly just creating th
 - M0 front-end / Lovable: publishable (anon) key only.
 - If a student pastes a `service_role` key into Lovable, the front-end, or `.env` committed to git → stop them, explain the blast radius, and have them rotate it (Supabase dashboard → Settings → API → roll).
 - Grep a deployed bundle for `service_role` → must be absent. (This is also an M3 go-live check.)
+- **Caching the *publishable* key in the `flight/supabase` Secrets Manager secret is fine** (M1 prereq) — it's public-by-design and it's only there so a new Cowork session recalls the `url`+`publishable_key` without a dashboard hunt. **Never** cache the service-role key anywhere, AWS included.
 
 ---
 
