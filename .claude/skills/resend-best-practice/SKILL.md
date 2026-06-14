@@ -13,7 +13,7 @@ When guiding a student through any Resend-touching code, **apply these rules pro
 
 > **Model note (differs from a source Resend project):** a sibling project used Resend the **Next.js** way — the `resend` npm SDK + a `lib/resend.ts` lazy client + Audiences/Broadcasts + an unsubscribe route. This course is **AWS Lambda + a plain REST POST + a single transactional alert** (no SDK, no audiences, no broadcasts, no unsubscribe flow). The deliverability principles (verified `from`, text+html, demo-sender-only-to-self) carry over; the SDK/Next.js/MCP plumbing does **not** and is dropped.
 
-This is the email-layer sibling of [[aws-best-practice]] (the Lambda/IAM/secrets/no-VPC side of the same send) and [[m1-flight-price-checker]] (Part 1.3, where the send is wired). The `from`-domain story finishes in [[m3-custom-domain-go-live]].
+This is the email-layer sibling of [[aws-best-practice]] (the Lambda/IAM/secrets/no-VPC side of the same send) and [[m1-flight-price-checker]] (Part 1.3, where the send is wired). The `from`-domain story finishes in [[m3-domain]].
 
 ---
 
@@ -41,7 +41,7 @@ Resend is a hosted REST API; the calling code (the Lambda) runs identically in b
 **Why:** This is the same **two-host gap** that shapes the AWS deploy ([[aws-best-practice]] *Cowork execution constraints*): the sandbox has tools but no network to arbitrary hosts; the connectors (AWS MCP) have network but aren't a shell. A GET check (like the Travelpayouts token URL) sneaks through the agent's web-fetch — but Resend needs a **POST + `Authorization` header + body**, which web-fetch can't do and the sandbox can't route. Students hit a confusing `blocked-by-allowlist / 403 on CONNECT` and think their key is wrong; it isn't — the *path* is wrong.
 
 **How to apply:**
-- **Verify the key in the prereq** by deploying a tiny **`flight-resend-test`** Lambda (inline CFN, reads `flight/resend`, POSTs to Resend) and invoking it via the AWS MCP — the Lambda runs *inside AWS* and has internet. Read the result from its **logs** (`filter-log-events`) + your inbox, not the invoke output (the MCP can't read that file). See [[m1-flight-price-checker-prerequisites]] Part E.
+- **Verify the key in the prereq** by deploying a tiny **`flight-resend-test`** Lambda (inline CFN, reads `flight/resend`, POSTs to Resend) and invoking it via the AWS MCP — the Lambda runs *inside AWS* and has internet. Read the result from its **logs** (`filter-log-events`) + your inbox, not the invoke output (the MCP can't read that file). See [[m1-flight-price-checker-prerequisites]] Part D.
 - **The real alert** is sent the same way — from `flight-fare-notification`, a Lambda. That's why M1.3's design never sends from the browser or the sandbox.
 - **Zero-code alternative for a pure key check:** the **Resend dashboard → Emails → Send** button (no network needed from your side at all).
 
@@ -68,7 +68,7 @@ Resend is a hosted REST API; the calling code (the Lambda) runs identically in b
 
 **How to apply:**
 - **M1.3 (sandbox):** `flight/resend` → `{"api_key":"re_…","from":"onboarding@resend.dev"}`.
-- **M3 (go-live):** Resend → Domains → add `yourdomain.com` → add the SPF + DKIM (and DMARC) records at the registrar → wait for **Verified** (often ~minutes once DNS propagates) → only **then** `put-secret-value` to flip `from` to `alerts@yourdomain.com`. Don't flip the secret before Verified ([[m3-custom-domain-go-live]] Step 3).
+- **M3 (go-live):** Resend → Domains → add `yourdomain.com` → add the SPF + DKIM (and DMARC) records at the registrar → wait for **Verified** (often ~minutes once DNS propagates) → only **then** `put-secret-value` to flip `from` to `alerts@yourdomain.com`. Don't flip the secret before Verified ([[m3-domain]] Step 3).
 - An **ASCII or CJK display name** is fine on a verified domain: `"矽谷機票通知 <alerts@yourdomain.com>"`.
 - The Lambda reads `from` from the secret — switching domains is a **secret update, not a redeploy**.
 
@@ -136,11 +136,30 @@ Pass both `html` and `text`. A **2xx with an `id`** = accepted (not "delivered" 
 
 ---
 
+### Rule 5a — After you change `flight/resend`, BUST the warm-container cache before testing (the "I updated the secret but it still 403s" trap)
+
+> **The rule:** A Lambda that reads `flight/resend` **at container init and caches it** (the normal, efficient pattern) keeps the **old** `api_key`/`from` in any **warm** container. So right after `put-secret-value` — most commonly the M3 flip of `from` to a verified domain — the next invocation can still use the stale `from` and **`403 validation_error`** even though the secret is already correct. Force a cold start before you test.
+
+**Why:** This is one of the most confusing M3 incidents: the secret in Secrets Manager is right, the domain is Verified, yet Resend keeps rejecting — because the running container never re-read the secret. It looks like the domain isn't verified or the secret didn't save; it's neither. Any config change recycles the container and forces a fresh `get_secret_value`.
+
+**How to apply:**
+```bash
+# any env-var change forces a cold start → fresh secret read
+aws lambda update-function-configuration --function-name flight-fare-notification \
+  --environment "Variables={CACHE_BUST=$(date +%s)}" --region us-east-1
+# repeat for flight-status-notification if it also reads flight/resend
+```
+- Do this **immediately after** every `flight/resend` `put-secret-value`, then test.
+- (Alternatively, read the secret per-invocation instead of caching — but that adds a Secrets Manager call to every send; the cache-bust-on-change pattern is cheaper.)
+- Symptom → fix map: "secret looks right + domain Verified, but still `403`" ⇒ stale warm container ⇒ cache-bust.
+
+---
+
 ### Rule 6 — Lambdas are NOT in a VPC — or the call to `api.resend.com` hangs and times out
 
 > **The rule:** Create the notification Lambdas with **no `--vpc-config`**. They need the public internet to reach `api.resend.com`.
 
-**Why:** A VPC removes the Lambda's default internet route — the POST to `api.resend.com` **hangs until the Lambda times out** (no error, just a stall) unless you also add a NAT gateway or VPC endpoint. There's no reason to be in a VPC here. If a student copied a VPC config from elsewhere and Resend (or Stripe/Travelpayouts) calls start timing out, **the VPC is the first suspect.** (This is [[aws-best-practice]] Rule 7.)
+**Why:** A VPC removes the Lambda's default internet route — the POST to `api.resend.com` **hangs until the Lambda times out** (no error, just a stall) unless you also add a NAT gateway or VPC endpoint. There's no reason to be in a VPC here. If a student copied a VPC config from elsewhere and Resend (or ECPay/Travelpayouts) calls start timing out, **the VPC is the first suspect.** (This is [[aws-best-practice]] Rule 7.)
 
 **How to apply:** Don't pass `--vpc-config` to `create-function`. Outbound HTTPS to Resend then works with zero config.
 
@@ -175,7 +194,7 @@ Pass both `html` and `text`. A **2xx with an `id`** = accepted (not "delivered" 
 
 > **The rule:** `to` is the subscriber's email — the same `email` that is the DynamoDB `subscriptions` partition key and the Supabase auth identity. The HTML/text body is built by `flightproxy/email_render.py` from the queued fare; don't hand-assemble email strings in the handler.
 
-**Why:** `email` is the one join key across Supabase auth ↔ DynamoDB ↔ the alert — sending to anything else (e.g. a Stripe billing email) mis-routes the alert. And the renderer already produces the correct bilingual card (**NT$ headline + optional 約 US$**, the 「立即訂購」 link), the subject, and the plain-text part; keeping the render logic in one place keeps it consistent with what the checklist verifies. Resend `to` accepts a single address or a list (≤50) — here it's the **one** subscriber.
+**Why:** `email` is the one join key across Supabase auth ↔ DynamoDB ↔ the alert — sending to anything else (e.g. a card-billing email from the payment provider) mis-routes the alert. And the renderer already produces the correct bilingual card (**NT$ headline + optional 約 US$**, the 「立即訂購」 link), the subject, and the plain-text part; keeping the render logic in one place keeps it consistent with what the checklist verifies. Resend `to` accepts a single address or a list (≤50) — here it's the **one** subscriber.
 
 **How to apply:**
 - `to = message["email"]`, `subject = email_render.subject(...)`, `html = email_render.render_html(...)`, `text = email_render.render_text(...)`.
@@ -226,9 +245,9 @@ Pass both `html` and `text`. A **2xx with an `id`** = accepted (not "delivered" 
 ## Cross-references
 
 - [[m1-flight-price-checker]] — Part 1.3, where the send is wired (the `flight-fare-notification` consumer + `flight/resend`).
-- [[m1-flight-price-checker-prerequisites]] — Part E: Resend account + sending key + the test-Lambda send.
+- [[m1-flight-price-checker-prerequisites]] — Part D: Resend account + sending key + the test-Lambda send.
 - [[m1-flight-price-checker-checklist]] — verifies the alert lands and that dedup holds (Sections J–L).
-- [[m3-custom-domain-go-live]] — verifying your own sending domain (SPF/DKIM) and flipping the `from`.
+- [[m3-domain]] — verifying your own sending domain (SPF/DKIM) and flipping the `from`.
 - [[aws-best-practice]] — Rule 2 (secrets), Rule 5 (SQS visibility timeout), Rule 6 (pure-Python layer), Rule 7 (no VPC) — the AWS side of the same send.
-- [[stripe-best-practice]] — the M2 welcome/cancel email follows the same dedup-via-status-SQS pattern.
+- [[ecpay-best-practice]] — the M2 welcome/cancel email follows the same status-SQS pattern (one consumer routed by `event_type`).
 - Resend send API: https://resend.com/docs/api-reference/emails/send-email · Batch: https://resend.com/docs/api-reference/emails/send-batch-emails · Domains: https://resend.com/docs/dashboard/domains/introduction
