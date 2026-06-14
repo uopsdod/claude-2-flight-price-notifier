@@ -44,7 +44,7 @@ ECPay is a hosted gateway with **no CLI** (unlike Stripe's). The calling code (t
 
 **How to apply:**
 - The `OrderResultURL` page shows a static "subscription confirmed" message (optionally `GET`s the row to display status, read-only).
-- The only `UpdateItem` that writes `active`/`expired` lives in the callback Lambdas (and the `/cancel` Lambda for `expired`).
+- The only `UpdateItem` that writes `active` lives in the callback Lambdas; `/cancel` writes `cancelled` (grace); the parser writes `expired` (grace lapsed / 6-strikes). See Rules 9, 10, 12.
 - The callbacks authenticate via their IAM role + the **CheckMacValue** on the payload (ECPay is not a logged-in user) — no Supabase credential.
 
 ---
@@ -55,33 +55,32 @@ ECPay is a hosted gateway with **no CLI** (unlike Stripe's). The calling code (t
 
 **Why:** This is the single most common ECPay bug, and it's *silent* — `CheckMacValue` fails, the Lambda 400s or skips, and the symptom looks like "ECPay isn't sending the callback" when really you're rejecting a valid one. (In My Site this exact bug — filtering `v === ''` — made *every* real callback fail; the fix was to keep empty strings and drop only `CheckMacValue` + truly-undefined keys.)
 
-**The CMV algorithm (SHA256, AIO — ported from the instructor's production code):**
+**The CMV algorithm (SHA256, AIO).** Use the **official `ecpayUrlEncode`** (it matches `UrlService::ecpayUrlEncode` in ECPay's PHP SDK) — **`~` MUST become `%7E`**, which Python's `quote_plus` does **not** do for you (`~` is "unreserved", left literal). An earlier compact helper had `("%7e","%7e")` which is a no-op that never encoded `~` → CMV mismatches on any value containing `~`. The verified version (passes **all** known-answer vectors in `.claude/skills/ecpay/test-vectors/checkmacvalue.json`):
 ```
 1. Drop CheckMacValue; KEEP empty-string fields, drop only truly-absent keys.
 2. Sort the remaining keys case-insensitively (A–Z).
 3. Join: HashKey={hashKey}&{k1}={v1}&{k2}={v2}&...&HashIV={hashIV}
-4. ecpayUrlEncode the whole string: URL-encode, lowercase, then apply
-   the .NET ↔ PHP fixups:  %20→+   then restore  - _ . ! * ( )  and  ~ → %7e
-5. sha256 hex of that string.
-6. UPPERCASE the hex.  → that's the CheckMacValue.
+4. ecpayUrlEncode: quote_plus → replace ~→%7E → lowercase → restore - _ . ! * ( )
+5. sha256 hex of that string.  6. UPPERCASE the hex → the CheckMacValue.
 ```
 ```python
 import hashlib, urllib.parse
-def _ecpay_urlencode(s: str) -> str:
-    s = urllib.parse.quote_plus(s).lower()
-    for a, b in (("%2d","-"),("%5f","_"),("%2e","."),("%21","!"),
-                 ("%2a","*"),("%28","("),("%29",")"),("%7e","%7e")):
-        s = s.replace(a, b)
-    return s
+def ecpay_url_encode(s: str) -> str:
+    e = urllib.parse.quote_plus(str(s)).replace("~", "%7E")  # quote_plus leaves ~ literal — fix it
+    e = e.lower()                                             # lowercase FIRST (so %7E→%7e)
+    for o, n in (("%2d","-"),("%5f","_"),("%2e","."),("%21","!"),
+                 ("%2a","*"),("%28","("),("%29",")")):        # .NET ↔ PHP restorations
+        e = e.replace(o, n)
+    return e
 def gen_cmv(params: dict, hash_key: str, hash_iv: str) -> str:
     items = {k: v for k, v in params.items() if k != "CheckMacValue"}  # KEEP "" values
     body = "&".join(f"{k}={items[k]}" for k in sorted(items, key=str.lower))
     raw = f"HashKey={hash_key}&{body}&HashIV={hash_iv}"
-    return hashlib.sha256(_ecpay_urlencode(raw).encode()).hexdigest().upper()
+    return hashlib.sha256(ecpay_url_encode(raw).encode()).hexdigest().upper()
 def verify_cmv(params, hash_key, hash_iv) -> bool:
     return params.get("CheckMacValue","").upper() == gen_cmv(params, hash_key, hash_iv)
 ```
-**How to apply:** verify in **both** callback Lambdas (factor into one shared helper). If verification fails, log the recomputed-vs-received MAC and return `0|CheckMacValueInvalid` (HTTP 400) — but first re-check you didn't drop empty fields. (See [[aws-best-practice]] for the same incident from the AWS/body-handling side.)
+**How to apply:** verify in **both** callback Lambdas (factor into one shared helper). **Before shipping, run your helper against `.claude/skills/ecpay/test-vectors/checkmacvalue.json`** (the official known-answer set, incl. the `~` and `'` cases) — if those pass, your CMV is correct. If a live callback fails, log the recomputed-vs-received MAC and return `0|CheckMacValueInvalid` (HTTP 400) — but first re-check you didn't drop empty fields. (See [[aws-best-practice]] for the same incident from the AWS/body-handling side, and the official **[[ecpay]]** skill for the reference implementation in 5 languages.)
 
 ---
 
@@ -104,13 +103,15 @@ Do the `UpdateItem` + SQS `SendMessage`, then return `1|OK`. Keep it fast — EC
 
 ### Rule 4 — Make the callbacks idempotent — ECPay WILL resend; activating twice must be a no-op
 
-> **The rule:** `UpdateItem`-ing a row to `active` must be safe to run more than once, AND the once-only side-effect (the welcome email) must be guarded. Use the ECPay `gwsr` (authorization number) and/or `MerchantTradeNo` as the idempotency key. Always return `1|OK` for an event you've already processed.
+> **The rule:** `UpdateItem`-ing a row to `active` must be safe to run more than once, AND the once-only side-effect (the welcome email) must be guarded. Key idempotency on **`MerchantTradeNo` + a status check**, NOT on `gwsr`. Always return `1|OK` for an event you've already processed.
 
-**Why:** ECPay resends each callback up to 4× (Rule 3), **and** in this course *two* callbacks can both run authorization logic — the S2S `ReturnURL` and (separately) any browser path — so the same charge can hit you more than once. Setting `subscription_status = active` twice is harmless; **sending a welcome email twice is not.** (My Site proved the resend/dual-path overlap is real in stage and that a `UNIQUE` trade-no is what makes it safe.)
+**Why:** ECPay resends each callback up to 4× (Rule 3), **and** in this course *two* callbacks can both run authorization logic — the S2S `ReturnURL` and (separately) any browser path — so the same charge can hit you more than once. Setting `subscription_status = active` twice is harmless; **sending a welcome email twice is not.**
+
+> **⚠️ `gwsr` came back EMPTY on the real 定期定額 first-period `ReturnURL` (verified live this session).** Field naming/case on the recurring callback differs from one-time AIO, and `Gwsr` was blank. **Idempotency keyed on `gwsr` alone would be weak/broken.** Key on `MerchantTradeNo` + "is the row already `active`?" instead. More generally: **capture a real callback payload before relying on any specific field name** — don't assume the one-time-AIO field set.
 
 **How to apply:**
 - The status write is naturally idempotent (`SET subscription_status = :active`). Good.
-- Before processing, check whether you've already recorded this `gwsr`/`MerchantTradeNo` on the row (or in a small processed-set). If so, skip the writes but **still return `1|OK`**.
+- Before processing, check by **`MerchantTradeNo`** whether you've already activated this order (e.g. the row is already `active` for that trade-no). If so, skip the writes but **still return `1|OK`**. (Store `merchant_trade_no` on the row at subscribe time — Rule 9 needs it for cancel anyway.)
 - The **welcome/cancel email** is the once-only action — decouple it: the producer (callback or cancel Lambda) **enqueues** a message stamped with `event_type` (`"welcome"`/`"cancel"`) to the **status SQS queue**, and the **single** `flight-status-notification` consumer branches on `event_type` and guards on whether it's already greeted this subscription. Don't email inline, and don't build two notification Lambdas — one consumer, routed by the field.
 
 ---
@@ -179,17 +180,33 @@ Use 模擬付款 freely in stage to confirm reachability; rely on a **real stage
 
 ---
 
-### Rule 9 — Cancel is an API call you make (`CreditCardPeriodAction`), not an event you receive
+### Rule 9 — Cancel is an API call you make (`CreditCardPeriodAction`), not an event you receive — and it grants a GRACE PERIOD, not instant expiry
 
-> **The rule:** To stop a recurring subscription, your `/cancel` Lambda must `POST` to `…/Cashier/CreditCardPeriodAction` with `MerchantID`, the original `MerchantTradeNo`, `Action=Cancel`, `TimeStamp`, and a `CheckMacValue`. Then `UpdateItem` the row → `expired` and enqueue the cancel email. There is **no ECPay equivalent of `customer.subscription.deleted`** arriving on its own.
+> **The rule:** To stop a recurring subscription, your `/cancel` Lambda `POST`s to `…/Cashier/CreditCardPeriodAction` with `MerchantID`, the original `MerchantTradeNo`, `Action=Cancel`, `TimeStamp`, `CheckMacValue` — which stops **future renewals**. But the user **keeps service until the period they already paid for ends**, so cancel sets status **`cancelled`** (a transition state, NOT `expired`), preserving `current_period_end`. There is **no ECPay equivalent of `customer.subscription.deleted`** arriving on its own.
 
-**Why:** Stripe sends a delete-event when a subscription is cancelled (in the dashboard or via API), so its webhook can react. ECPay doesn't push an unsolicited "cancelled" callback — **you** initiate the cancel and **you** flip the status. If a student waits for a callback to mark `expired`, it never comes and the user keeps getting (and being charged for) the subscription.
+**Why:** ECPay doesn't push an unsolicited "cancelled" callback — **you** initiate the cancel and **you** flip the status. And flipping straight to `expired` is *wrong product behavior*: the customer paid through the end of the current period, so cutting alerts off the instant they cancel cheats them. Cancel = "don't renew," not "revoke now."
 
-**How to apply:**
+**How to apply (the cancellation-grace lifecycle — the single biggest thing the naive design gets wrong):**
 - Store `merchant_trade_no` on the `subscriptions` row at subscribe time (you need it to cancel).
-- `/cancel` Lambda: build `{MerchantID, MerchantTradeNo, Action: "Cancel", TimeStamp}` + CMV, POST it (stdlib `urllib`), then `UpdateItem expired` + enqueue cancel email.
-- There's **no Stripe Customer Portal** — the self-service 退訂 button on `/account` calls *your* `/cancel` route. (A failed recurring charge can also end the series — see Rule 10.)
+- **Track `current_period_end`** (a sortable ISO timestamp; keep a human `current_period_end_date` too): **set it on the first charge** (`flight-ecpay-return`) and **refresh it on every renewal** (`flight-ecpay-period`) — each successful charge extends the paid-through date by one period.
+- `/cancel` Lambda: call ECPay `Action=Cancel`, then `UpdateItem` status → **`cancelled`** (keep `current_period_end`), enqueue the cancel email. Do **not** set `expired` here.
+- **The parser gate must serve `active` AND `cancelled`-within-period rows**, and **lazily flip `cancelled` → `expired`** once `current_period_end` has passed (the parser is the natural place to do this since it scans the rows anyway — see Rule 12).
+- **A `cancelled`-in-grace subscriber can still update their target price** in place — no re-payment, status stays `cancelled`. (Their existing watch is still live until the period ends.)
+- **Migration edge case (will bite you):** rows activated *before* you added period-tracking have **no `current_period_end`** — on cancel, **fall back to `now + 1 month`** so the parser doesn't expire them on its very next run. Backfill any pre-existing `active` rows with a `current_period_end` too.
+- There's **no Stripe Customer Portal** — the self-service 退訂 button on `/account` calls *your* `/cancel` route.
 - **`ReAuth` (re-authorize a failed charge) cannot be tested on the stage merchant** — only `Cancel` is testable on stage. Don't build the course around verifying `ReAuth` end-to-end.
+- **Stage cancel of a never-paid order returns `90100150 不存在的訂單編號`** — expected for a synthetic `MerchantTradeNo` that never entered the scheduler. The `/cancel` Lambda should **log it and still cancel/expire locally** (which is the correct, idempotent behavior).
+
+**Subscription lifecycle (the full state machine):**
+```
+pending_payment ──(first charge ReturnURL)──▶ active ⇄ (target-price updates, in place)
+       ▲                                        │
+       │ (re-subscribe + pay)                   │ /cancel  (ECPay Action=Cancel; keep current_period_end)
+       │                                        ▼
+   expired ◀──(parser: current_period_end passed)── cancelled (grace — still alerted, can update target)
+       ▲                                        ▲
+       └──(6 consecutive failed renewals — Rule 10)┘
+```
 
 ---
 
@@ -203,6 +220,32 @@ Use 模擬付款 freely in stage to confirm reachability; rely on a **real stage
 - `flight-ecpay-period` on `RtnCode == "1"` → keep `active` (optionally record `last_charged_at`, `TotalSuccessTimes`). On `RtnCode != "1"` → **log a failed-attempt counter, don't expire yet**; optionally email the customer to update their card around attempt #3.
 - Treat the series as ended (→ `expired`) when ECPay's payload/Query indicates termination (the 6th failure auto-cancels), or when *you* called `Cancel` (Rule 9).
 - **Reconciliation Lambda / on-demand check:** `POST …/Cashier/QueryCreditCardPeriodInfo` with `{MerchantID, MerchantTradeNo, TimeStamp}` + CMV → returns the order's executed/successful counts and per-charge records. Use it to recover a missed `PeriodReturnURL` and to drive `expired` decisions. (Deep field reference: the official **[[ecpay]]** skill, `guides/01-payment-aio.md` 定期定額 section + `QueryPeridicTrade.php`.)
+
+---
+
+### Rule 11 — `OrderResultURL` is a browser **POST** — point it at a redirect Lambda, NEVER at the static SPA (else a 405 right after payment)
+
+> **The rule:** `OrderResultURL` (the front-end return URL) is delivered by ECPay as an **auto-submit POST**, not a GET. A static SPA host (Vercel/Netlify/S3) only serves **GET** on a page route, so a POST to `<site>/account?purchase=success` returns **HTTP 405 "This page isn't working"** — the user sees an error the instant after they pay. Point `OrderResultURL` at a tiny **POST-capable endpoint that `302`-redirects** to the SPA.
+
+**Why (verified live this session):** the payment itself **still succeeds** — the S2S `ReturnURL` is what activates the row (Rule 1), so this is purely a *UX* bug, not a payment bug. But "I paid and got an error page" destroys trust. ECPay POSTs `OrderResultURL`; a static host has no POST handler for an app route; 405. (This is *why* Rule 1 matters — activation never depended on the browser landing.)
+
+**How to apply:**
+- Add a small Lambda (`flight-ecpay-result`) behind **`ANY /ecpay-result`** that returns `302 Location: https://<site>/app?purchase=success` (read `RtnCode` from the POST body if you want success/fail branching). It does **no** auth work — activation is the `ReturnURL`'s job.
+- Set `OrderResultURL=<api>/ecpay-result` in the checkout form (NOT the SPA page).
+- Symptom to recognize: "I get a 405 / 'This page isn't working' right after paying, but my row still went `active`." → `OrderResultURL` points at the static SPA; add the redirect Lambda.
+
+---
+
+### Rule 12 — The parser gate serves `active` AND `cancelled`-in-grace, and is where `cancelled → expired` happens lazily
+
+> **The rule:** The paywall gate in the parser is **not** simply `subscription_status = active`. It must alert **`active` OR (`cancelled` AND `current_period_end` not yet passed)** — and, since the parser already scans every row, it's the natural place to **lazily flip `cancelled` → `expired`** once the paid-through date passes.
+
+**Why:** Cancellation grants a grace period (Rule 9), so a `cancelled`-in-grace subscriber is still a paying customer until their period ends — they must keep getting alerts. And nobody pushes a "now expired" event when the grace period lapses; the parser noticing `current_period_end < now` on its next scan is what actually retires the row. A naive `status == "active"` gate cuts off grace-period users immediately (wrong) and never expires `cancelled` rows (they'd be alerted forever).
+
+**How to apply:**
+- Parser scan/filter: include a row if `subscription_status == "active"`, **or** `subscription_status == "cancelled"` and `current_period_end >= now`.
+- When the parser sees a `cancelled` row whose `current_period_end < now`, `UpdateItem` it → `expired` (and stop alerting). `pending_payment`/`expired` are never alerted.
+- This composes with Rule 10 (6-strikes failure → `expired`) — both are "the parser/period-handler retires the row," just on different triggers.
 
 ---
 
@@ -236,6 +279,9 @@ Use 模擬付款 freely in stage to confirm reachability; rely on a **real stage
 11. **`%26`/`%3C` in callback params need `urldecode` first** — ECPay's doc warns that any field value containing `%26`(`&`) or `%3C`(`<`) must be `urldecode`d before you use/verify it, or the call fails. `urllib.parse.parse_qs(..., keep_blank_values=True)` already decodes percent-escapes for you — just don't double-encode when recomputing the CMV.
 12. **Monthly billing-day edge case** (`PeriodType=M`) — ECPay charges on the same day-of-month as the first charge; **if that day doesn't exist in a month (e.g. the 31st), it bills on the last day of that month**. Harmless for us (amount is fixed), but know it before a customer queries "why charged on the 28th." (Our daily-`D` test path sidesteps this entirely.)
 13. **First auth must succeed or there's no schedule** — *「若第一次授權失敗,此訂單不會進入排程,需重新建立一筆訂單」*. A failed first charge yields **no** `PeriodReturnURL` ever; the row stays `pending_payment` and the user must re-subscribe. Don't expect renewals from an order whose first auth failed.
+14. **`OrderResultURL` 405 ≠ payment failure** (Rule 11) — a static SPA returns 405 to ECPay's POST; the row still activated via `ReturnURL`. Add a `flight-ecpay-result` 302-redirect Lambda; never blame the payment.
+15. **`gwsr` is empty on the recurring first-period callback** (Rule 4) — key idempotency on `MerchantTradeNo`, and capture a real payload before depending on any field name.
+16. **Resend sandbox only delivers to the account owner** — welcome/cancel/fare emails from `onboarding@resend.dev` reach **only your own verified address**; any other recipient `403`s `validation_error`. Tests look broken but aren't — verify a sending domain at go-live ([[resend-best-practice]]). Tie this to M3.
 
 ---
 

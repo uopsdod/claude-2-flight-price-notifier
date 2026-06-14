@@ -11,39 +11,53 @@ Confirms the paywall really works end-to-end: recurring checkout → callback (C
 
 ## Execution mode
 
-CLI uses `aws`/`curl`/`python3`; Cowork uses AWS MCP + the ECPay 廠商後台. `aws` commands `--region us-east-1`. (No `ecpay` CLI — use the dashboard 模擬付款 button + real stage test-card runs.)
+Mainly **Cowork** — paste checks to the agent with the **AWS API MCP**; CLI runs the same `aws` lines. All commands `--region us-east-1`, `[default]` profile. MCP rules that bite here: **verify by effect** (can't `cat` an `invoke`/output file — read the DynamoDB row or the logs instead); **`filter-log-events`**, not `logs tail`; **no JMESPath backtick literals** (use `SecretList[].Name`, scan the list). There is **no `ecpay` CLI or MCP** — ECPay-side steps are driven from the **廠商後台** (模擬付款 button + 信用卡定期定額訂單查詢) and from a real **stage test-card** run in the browser. The `POST` checks (`/subscribe`, `/cancel`, `/ecpay-result`) are **mode-dependent**: Cowork can't POST (no shell with AWS net; the web tool is GET-only) → prove those by their **effect** (the DynamoDB row + the callback logs) and by driving the live form in the browser. CLI can run the `curl` lines directly.
 
 ## How to run
 
-Run each check and report. Ask for the API base URL and a test inbox. (Subscription rows are read from DynamoDB with `aws dynamodb get-item`.)
+Run each check and report. Ask the student for: the API Gateway base URL, the live Vercel URL, and a test inbox.
+
+> **⚠️ Use the Resend-account owner's email as the test subscriber for B3 / C1 / E1.** While `flight/resend` still sends from `onboarding@resend.dev` (pre-M3, no verified domain), the Resend **sandbox only delivers to the account owner's own verified address** — any other recipient `403`s `validation_error` and the welcome/cancel email silently never arrives. So set the subscriber email to **your Resend-account email** (e.g. `uopsaoa@gmail.com`) — the examples below write `<your-resend-account-email>`; substitute that address everywhere. Using a throwaway like `pay@test.com` here would make C1/E1's email checks fail for the wrong reason. (See [[ecpay-best-practice]] watch-out 16.)
+
+Subscription rows are the authoritative source — read them with `aws dynamodb get-item` (works identically via the AWS API MCP).
 
 ### Section A — ECPay checkout form
 - **A1** The `flight/ecpay` secret exists with stage `merchant_id` + an `amount`: `aws secretsmanager get-secret-value --secret-id flight/ecpay --region us-east-1 --query SecretString --output text`.
-- **A2** `POST /subscribe` returns an **auto-submit HTML form** whose `action` is the ECPay cashier and that contains a `CheckMacValue` hidden field + `PeriodType`/`PeriodAmount`:
-  ```bash
-  curl -s -X POST "<api>/subscribe" -H "content-type: application/json" \
-    -d '{"email":"pay@test.com","origin":"TPE","destination":"TYO","depart_month":"2026-07","target_price":400}' \
-    | grep -oE 'AioCheckOut/V5|CheckMacValue|PeriodType'
-  ```
-  Expect all three tokens. (Also confirm a `pending_payment` row with a `merchant_trade_no` was written.)
+- **A2** `POST /subscribe` returns an **auto-submit HTML form** whose `action` is the ECPay cashier and that contains a `CheckMacValue` hidden field + `PeriodType`/`PeriodAmount`. **Mode-dependent:**
+  - **CLI:**
+    ```bash
+    curl -s -X POST "<api>/subscribe" -H "content-type: application/json" \
+      -d '{"email":"<your-resend-account-email>","origin":"TPE","destination":"TYO","depart_month":"2026-07","target_price":400}' \
+      | grep -oE 'AioCheckOut/V5|CheckMacValue|PeriodType'
+    ```
+    Expect all three tokens.
+  - **Cowork** (can't POST): submit the subscribe form in the **browser** on the live Vercel URL and confirm it bounces to the ECPay cashier (URL contains `AioCheckOut/V5`) — that proves the form + CMV server-side. Then verify by **effect**: a `pending_payment` row with a `merchant_trade_no` was written (B-section `get-item` below works for this).
+  - **Both:** confirm the `pending_payment` row with a `merchant_trade_no` exists:
+    ```bash
+    aws dynamodb get-item --table-name subscriptions \
+      --key '{"email":{"S":"<your-resend-account-email>"},"route":{"S":"TPE-TYO"}}' \
+      --region us-east-1 --query 'Item.{status:subscription_status,mtn:merchant_trade_no}'
+    ```
 
 ### Section B — Callbacks verify CMV + flip to active
-- **B1** Both callback Lambdas exist: `for fn in flight-ecpay-return flight-ecpay-period; do aws lambda get-function --function-name $fn --region us-east-1 --query 'Configuration.FunctionName'; done`
-- **B2** CheckMacValue verification works (no rejects). Trigger the first-period callback via the stage 後台「模擬付款」 (or a real test-card run) and watch logs:
+- **B1** Both callback Lambdas exist — two separate calls (Cowork MCP runs one API call at a time, no shell loop): `aws lambda get-function --function-name flight-ecpay-return --region us-east-1 --query 'Configuration.FunctionName'` and `aws lambda get-function --function-name flight-ecpay-period --region us-east-1 --query 'Configuration.FunctionName'`.
+- **B2** CheckMacValue verification works (no rejects). Trigger the first-period callback via the stage 後台「模擬付款」 (or a real test-card run) and read the logs — use `filter-log-events` (Cowork MCP has no `logs tail`):
   ```bash
-  aws logs tail /aws/lambda/flight-ecpay-return --since 5m --region us-east-1 | grep -iE "verified|CheckMacValue|active|1\|OK|error"
+  aws logs filter-log-events --log-group-name /aws/lambda/flight-ecpay-return \
+    --query "events[].message" --region us-east-1
   ```
-  Should show CMV verified + `UpdateItem` + replied `1|OK`, no CheckMacValueInvalid. **And** a bare 模擬付款 (`SimulatePaid=1`) must NOT grant active (the row stays `pending_payment`).
+  Look for CMV verified + `UpdateItem` + replied `1|OK`, no `CheckMacValueInvalid`. **And** a bare 模擬付款 (`SimulatePaid=1`) must NOT grant active (the row stays `pending_payment` — confirm via the `get-item` in B3).
 - **B3** **The decisive test:** complete a real **stage test-card** payment (`4311-9522-2222-2222`, `12/30`, CVV `222`, OTP `1234`) via the form → the row flips to `active`:
   ```bash
   aws dynamodb get-item --table-name subscriptions \
-    --key '{"email":{"S":"pay@test.com"},"route":{"S":"TPE-TYO"}}' \
+    --key '{"email":{"S":"<your-resend-account-email>"},"route":{"S":"TPE-TYO"}}' \
     --region us-east-1
   ```
-  Expect `subscription_status=active`, `ecpay_gwsr` + `merchant_trade_no` set.
+  Expect `subscription_status=active`, `merchant_trade_no` + `current_period_end` set. *(Don't expect `gwsr` — it comes back **empty** on the real 定期定額 first-period callback; idempotency keys on `merchant_trade_no`. See [[ecpay-best-practice]] Rule 4.)*
 - **B4** *(renewal — `PeriodReturnURL`/`flight-ecpay-period`; optional/time-gated)* To verify the renewal path the faithful way, subscribe once with a **daily** period (`PeriodType=D, Frequency=1, ExecTimes=2`) and pay the first charge **successfully** (a failed first auth never enters the scheduler). **The next day**, confirm the scheduler fired the 2nd charge into your period handler:
   ```bash
-  aws logs tail /aws/lambda/flight-ecpay-period --since 24h --region us-east-1 | grep -iE "verified|TotalSuccessTimes|1\|OK|error"
+  aws logs filter-log-events --log-group-name /aws/lambda/flight-ecpay-period \
+    --query "events[].message" --region us-east-1
   ```
   Expect CMV-verified, replied `1|OK`, `TotalSuccessTimes=2`, no `SimulatePaid`. *(Fast smoke-only alternative: 模擬付款 on the recurring order → reaches `flight-ecpay-period` with `SimulatePaid=1`; proves reachability + CMV + `1|OK` but not the real bookkeeping — see the M2 skill Step 3.)* Mark ⚠️ "pending next-day check" if you ran the checklist same-day.
 
@@ -51,34 +65,45 @@ Run each check and report. Ask for the API base URL and a test inbox. (Subscript
 - **C0** The status queue + its single consumer exist: `aws sqs get-queue-url --queue-name flight-status-queue --region us-east-1` and `aws lambda get-function --function-name flight-status-notification --region us-east-1 --query 'Configuration.FunctionName'`.
 - **C1** After B3, a **welcome** email arrives at the test inbox (the `flight-ecpay-return` callback enqueued `{event_type:"welcome"}` → the one `flight-status-notification` consumer sent it via Resend).
 
-- **B5** *(`OrderResultURL` returns 302, not 405)* The browser-return endpoint redirects instead of erroring. ECPay delivers it as a **POST**:
-  ```bash
-  curl -s -o /dev/null -w "%{http_code}\n" -X POST "<api>/ecpay-result" -d "RtnCode=1"
-  ```
-  Expect **`302`** (Location → `/app?purchase=success`), **NOT `405`**. A 405 means `OrderResultURL` points at the static SPA (Rule 11) — the payment still works but the UX is broken.
+- **B5** *(`OrderResultURL` returns 302, not 405)* The browser-return endpoint redirects instead of erroring. ECPay delivers it as a **POST**. **Mode-dependent:**
+  - **CLI:**
+    ```bash
+    curl -s -o /dev/null -w "%{http_code}\n" -X POST "<api>/ecpay-result" -d "RtnCode=1"
+    ```
+    Expect **`302`** (Location → `/app?purchase=success`), **NOT `405`**.
+  - **Cowork** (can't POST): you already exercise this for real in B3 — after the stage test-card payment the browser is returned to the app; if you **land on `/app?purchase=success`** (not an error page) the `OrderResultURL` redirect is working. As a cross-check, confirm a dedicated `flight-ecpay-result` Lambda exists (`aws lambda get-function --function-name flight-ecpay-result --region us-east-1 --query 'Configuration.FunctionName'`) — its absence is the 405 cause.
+  
+  A 405 means `OrderResultURL` points at the static SPA (Rule 11) — the payment still works but the UX is broken.
 
 ### Section D — Gating works, grace-aware (the point of M2)
-- **D0** The parser gate (Step 4) is **grace-aware**, not plain `active` — invoking the parser for a route with a `pending_payment` row whose target is met does NOT enqueue it:
+- **D0** The parser gate (Step 4) is **grace-aware**, not plain `active` — invoking the parser for a route with a `pending_payment` row whose target is met does NOT enqueue it. Invoke, then verify **by logs** (Cowork can't `cat` the output file — read `filter-log-events`):
   ```bash
   aws lambda invoke --function-name flight-parser \
     --payload '{"origin":"TPE","destination":"TYO","route":"TPE-TYO"}' /tmp/p.json \
     --region us-east-1
-  aws logs tail /aws/lambda/flight-parser --since 3m --region us-east-1 | grep -iE "active|cancelled|skip|enqueue|expired"
+  aws logs filter-log-events --log-group-name /aws/lambda/flight-parser \
+    --query "events[].message" --region us-east-1
   ```
+  Look for the gate decision (`active`/`cancelled`/`skip`/`enqueue`/`expired`) in the messages.
 - **D1** The now-`active` row (target above live fare) **is** enqueued + emailed when the parser runs → fare email arrives.
 - **D2** A `pending_payment` (unpaid) row is NOT enqueued/emailed. Confirms payment gates alerts.
 - **D3** A `cancelled` row with a **future** `current_period_end` **IS** still enqueued (grace). A `cancelled` row with a **past** `current_period_end` is NOT, and the parser flips it to `expired` on that run.
 
 ### Section E — Cancellation (an API call you make; grace, not instant expiry)
-- **E1** The cancel Lambda exists; `POST /cancel` calls `CreditCardPeriodAction` and flips the row to **`cancelled`** (NOT `expired`), preserving `current_period_end`:
-  ```bash
-  curl -s -X POST "<api>/cancel" -H "content-type: application/json" -d '{"email":"pay@test.com","route":"TPE-TYO"}'
-  aws dynamodb get-item --table-name subscriptions \
-    --key '{"email":{"S":"pay@test.com"},"route":{"S":"TPE-TYO"}}' \
-    --region us-east-1 --query 'Item.{status:subscription_status,end:current_period_end}'
-  ```
+- **E1** The cancel Lambda exists; `POST /cancel` calls `CreditCardPeriodAction` and flips the row to **`cancelled`** (NOT `expired`), preserving `current_period_end`. **Mode-dependent — trigger the cancel, then verify by effect:**
+  - **CLI** triggers it directly:
+    ```bash
+    curl -s -X POST "<api>/cancel" -H "content-type: application/json" -d '{"email":"<your-resend-account-email>","route":"TPE-TYO"}'
+    ```
+  - **Cowork** (can't POST): click **取消訂閱** in the live app UI for that subscriber instead.
+  - **Both** then read the authoritative row (works via the AWS API MCP):
+    ```bash
+    aws dynamodb get-item --table-name subscriptions \
+      --key '{"email":{"S":"<your-resend-account-email>"},"route":{"S":"TPE-TYO"}}' \
+      --region us-east-1 --query 'Item.{status:subscription_status,end:current_period_end}'
+    ```
   Expect `status=cancelled` with `current_period_end` set. A **cancel** email also arrives (same status consumer, `{event_type:"cancel"}`). In the 後台 → 信用卡定期定額訂單查詢, the series shows terminated (no more renewals). *(Stage cancel of a never-paid synthetic order returns `90100150 不存在的訂單編號` — expected; the Lambda should log it and still cancel locally, not treat it as a failure.)*
-- **E2** A `cancelled`-in-grace subscriber can **update their target price** in place (JSON response from `/subscribe`, no re-payment, status stays `cancelled`).
+- **E2** A `cancelled`-in-grace subscriber can **update their target price** in place (no re-payment, status stays `cancelled`). **Mode-dependent:** CLI re-POSTs `/subscribe` with a new `target_price` and expects a JSON response (not an ECPay form); Cowork edits the target in the **live app form** instead. **Both** confirm by **effect** with `get-item` — `target_price` changed, `subscription_status` still `cancelled`, no new `pending_payment`.
 - **E3** Lifecycle end-to-end: `pending_payment → active → cancelled (grace, still alerted) → expired` (after `current_period_end` passes, via the parser). The expired row is no longer enqueued/emailed.
 
 ## Reporting
