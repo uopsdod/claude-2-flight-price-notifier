@@ -9,6 +9,8 @@ This course's AWS side is **100% serverless** — there is **no EC2, no SSH, no 
 
 When guiding a student through AWS operations, **apply these rules proactively** — stop them before they break one. Each rule maps to a real failure mode of *this* stack.
 
+> **Multi-account variant (M3 go-live):** the AWS MCP uses **one `[default]` profile**, but the **domain's Route 53 hosted zone** can live in a **different AWS account** than the flight project (Lambdas/secrets/API Gateway). When they differ, **switch the `[default]` profile between DNS steps (domain account) and secret/Lambda steps (project account)** — see [[m3-domain-prerequisites]]. For a single-account student this doesn't arise; treat it as the advanced case.
+
 > Adapted from a Course 2 AWS skill that was EC2/SSM-based. Those rules (SSH-vs-SSM, systemd PATH, instance tagging) **do not apply** — this stack has no servers to log into. Only the secrets-hygiene and IAM-user rules carried over; the rest below are serverless-native.
 
 ---
@@ -49,6 +51,8 @@ So you **cannot** get a built zip to S3 by any direct path: the sandbox has the 
    - **`s3api put-object` Body can't be inlined.** `--cli-input-json '{"Body":"…"}'` is a streaming blob the CLI **silently drops → a 0-byte object**, and there's **no `--body <file>`** to point at without a shell. This is *why* the `flight-seed` bridge exists, not a clever one-liner.
 5. **Git on the mounted folder fails.** `git clone`/ops in the mounted workspace folder error (`config.lock: Operation not permitted` — FUSE can't do git's locking). **Clone into a native dir** (the agent's home); treat the working copy as **ephemeral** — GitHub + Vercel are the source of truth.
 
+**→ Deployed shape ≠ repo layout (state this up front).** Every function in this stack deploys as a **single-file `index.handler`** — *not* the `aws/<fn>/handler.py` + a `common/` package the repo sources suggest, and *not* `zip … --zip-file fileb://`. In Cowork the sandbox has **no network route to AWS**, so code goes in **inside the API call** (inline CFN, Method 1) or **via the base64→S3 bridge** (Method 2). Fold shared helpers (CMV, ddb access) **into each `index.py`** rather than importing a package. (The repo's `aws/` tree can lag the deployed code — the verified M2 sources live single-file; treat the deployed function as the source of truth for behavior.)
+
 **→ The Cowork way to deploy Lambda code (two methods):**
 
 **Method 1 — inline `Code.ZipFile` (single small file).** Send the code *inside* the API call — **CloudFormation with inline `Code.ZipFile`**: `aws cloudformation create-stack --template-body '<json>'`, function code inline, no file transfer. **Limits: single file, ≤4096 chars, handler `index.handler`.** This is how M1.1's one-file Lambdas (`save_subscription`, `list_subscriptions`) deploy — they use only boto3 (already in the runtime), so no extra files.
@@ -87,12 +91,21 @@ So you **cannot** get a built zip to S3 by any direct path: the sandbox has the 
 >   --query "ETag" --region us-east-1     # strip the quotes → must equal `md5 -q parser.zip`
 > ```
 >
-> **For anything bigger than ~1–2 KB, chunk it** — one fragile giant paste is the single biggest time-sink. Recipe:
+> **Chunk-with-ETag is the DEFAULT for any zip > ~1.5 KB — not an optional fallback.** A single long base64 `--payload` **silently corrupted 3 times in one session** (`status_notification` once, `save_subscription` twice) — each time a *same-length* one-character substitution that only the ETag-vs-md5 check caught. One fragile giant paste is the single biggest time-sink; reserve single-shot for genuinely tiny files. Recipe:
 > 1. `base64 -w0 parser.zip` → split into ~600-char pieces **aligned to 4-char boundaries** (each piece decodes to whole bytes; the last carries the `=` padding).
 > 2. Seed each piece to its **own** key via `flight-seed` (short pastes rarely corrupt).
 > 3. **Verify each part's S3 ETag against the local md5 of that decoded piece**; re-seed only a mismatched part.
-> 4. Concatenate the parts with a tiny **`flight-assemble`** Lambda (boto3-only: read each part, write the joined object).
-> 5. **Gate the deploy on `assembled-object ETag == local-zip md5`.**
+> 4. Concatenate the parts with **`flight-assemble`** (boto3-only: read each part in order, write the joined object). **Deploy `flight-assemble` once as a persistent helper alongside `flight-seed`** — it's a required piece of this stack's toolchain, not ad-hoc (it had to be recreated mid-session because it wasn't standing). Inline-CFN it the same way:
+>    ```python
+>    import boto3
+>    def handler(e, c):
+>        s3 = boto3.client("s3"); buf = b""
+>        for k in e["parts"]:                      # ordered list of part keys
+>            buf += s3.get_object(Bucket=e["bucket"], Key=k)["Body"].read()
+>        s3.put_object(Bucket=e["bucket"], Key=e["key"], Body=buf, ContentType="application/zip")
+>        return {"ok": True, "key": e["key"], "bytes": len(buf)}
+>    ```
+> 5. **HARD RULE: never `update-function-code`/`create-function` until the assembled-object ETag == the local-zip md5.** No exceptions — a passing size check is not enough (see the same-length-substitution case above).
 >
 > And a function whose create **failed** on a bad zip is stuck `State=Failed` — `update-function-code` is blocked; **delete and recreate** it once the zip verifies.
 
