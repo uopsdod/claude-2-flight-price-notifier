@@ -1,93 +1,83 @@
 ---
 name: m3-domain-checklist
-description: Flight Price Notifier Milestone 3 GO-LIVE checklist — the AI walks every pre-launch item one-by-one (custom domain serves HTTPS, emails from your domain land in inbox AND reach a non-owner recipient, the ECPay checkout + callbacks work on the production address, CORS locked to your domain, secrets correct, no test data) so nothing is missed before opening for business. Use when the student says "驗收 M3", "上線檢查", "go-live checklist", or after `m3-domain` Step 5.
+description: Flight Price Notifier Milestone 3 GO-LIVE checklist — verifies the things M3 actually changes: the custom domain serves the site over HTTPS, the Resend email sender uses the domain (reaching a non-owner inbox, proving the M2 sandbox limit is lifted), and the secrets are consistent. Use when the student says "驗收 M3", "上線檢查", "go-live checklist", or after `m3-domain`.
 ---
 
-# M3 — Go-Live Checklist（上線檢查清單，一條一條確認，不漏掉）
+# M3 — Go-Live Checklist（上線檢查清單）
 
 ## What this skill does
 
-This is the **go-live gate**. Before the product opens for business, the AI actively verifies every launch-critical item — domain, email deliverability, payments, security, and data hygiene — and reports a clear ✅/⚠️/❌ per item. This is the "上線檢查清單 Skill" the course promises: AI 幫你一條一條確認過，不漏掉。
+Confirms the things M3 actually changes are live: **(1) the site is on your custom domain**, **(2) email is sent from your domain and reaches anyone** (not just your own inbox), and **(3) the secrets are consistent**. Reports a clear ✅/⚠️/❌ per item.
 
-Run after `m3-domain` Step 5, or any time before launch.
+> **Scope note.** This checklist is deliberately scoped to the **domain + email cutover** — the things M3 introduces. It does **not** re-run the payment journey or grep the front-end bundle: M3 doesn't touch the payment path (the ECPay callbacks stay on the API Gateway URL and are hit server-to-server), so payments are an M2 concern ([[m2-ecpay-subscription-checklist]]), and the front-end secret-hygiene check belongs to general launch prep. Run those separately if you need a full launch audit.
 
 ## Execution mode
 
-CLI uses `curl`/`aws`/`vercel`; Cowork uses dashboards/MCP. `aws` commands `--region us-east-1`.
+CLI uses `curl`/`aws`; Cowork uses dashboards/MCP. `aws` commands `--region us-east-1`.
 
 ## How to run
 
-Ask the student for: their custom domain, the API base URL, and a test inbox. (Subscription data is read from DynamoDB.) Then run each section and report.
+Ask the student for: their custom domain (or subdomain), the API id, and a **non-owner** test inbox. Then run each section and report.
 
-### Section A — Domain & HTTPS
-- **A1** Apex serves the app over HTTPS:
+### Section A — Site on the custom domain
+- **A1** The domain serves the app over HTTPS with a valid cert:
   ```bash
-  curl -sS -o /dev/null -w "%{http_code}\n" https://yourdomain.com          # 200
+  curl -sSI https://yourdomain.com | head -1          # HTTP/2 200
   ```
-- **A2** `www` also resolves (and redirects to the canonical, or vice-versa):
-  ```bash
-  curl -sS -o /dev/null -w "%{http_code} %{url_effective}\n" -L https://www.yourdomain.com
-  ```
-- **A3** Valid TLS cert (no warning): `curl -sSI https://yourdomain.com | head -1` → `HTTP/2 200`.
+  (If you bound a subdomain like `fly.yourdomain.com`, check that exact host. A bad/missing cert makes `curl` error out — so a clean `200` also confirms TLS. DNS can take minutes to propagate; a first-try failure may just be propagation — wait and retry.)
 
-### Section B — Email deliverability
-- **B1** Resend domain shows **Verified** (SPF + DKIM). 
+### Section B — Email sender on your domain
+- **B1** Resend shows the sending domain (or sending subdomain) **Verified** (SPF + DKIM).
 - **B2** Secret `from` is your domain:
   ```bash
   aws secretsmanager get-secret-value --secret-id flight/resend --region us-east-1 \
     --query SecretString --output text | grep -o 'alerts@[^"]*'
   ```
-- **B3** **Deliverability test:** trigger a price-check email → it arrives **from `alerts@yourdomain.com`**, in the **inbox** (not spam). This is the one most likely to be ⚠️.
-- **B4** **Non-owner delivery (the M2 sandbox-lift):** send a test alert to an address that is **NOT** your Resend-account email (a friend's, a second inbox). It must arrive — proving domain verification lifted the sandbox-only-delivers-to-owner limit. If it 403s `validation_error`, the domain isn't actually Verified yet (B1).
+- **B3** **Non-owner delivery (the sandbox-lift proof):** a real send to an inbox that is **NOT** your Resend-account email must arrive, from `alerts@<your domain>`. This one test covers both "sends from your domain" and "reaches real users."
 
-### Section C — Payments on the real domain
-- **C1** The ECPay checkout works from the live domain (submit the real form on `https://yourdomain.com` → reaches the ECPay cashier).
-- **C2** The **callback URLs** the checkout form hands ECPay (`ReturnURL`/`PeriodReturnURL`) resolve on the production address (your custom domain or the API GW), and a recent first-period payment shows CMV-verified + `1|OK` in `flight-ecpay-return` logs.
-- **C3** If switched to production: `flight/ecpay` has the **real** `merchant_id`/`hash_key`/`hash_iv` and `env:"prod"` (cashier resolves to `payment.ecpay.com.tw`), and 信用卡定期定額 is confirmed enabled on the merchant. If staying on the stage merchant for now: documented as such.
+  **Cowork recipe** (you can't `curl api.resend.com` from the sandbox — send from the Lambda; [[resend-best-practice]] Rule 0):
+  1. **Bust the cache first** if you just changed `flight/resend` — else you get a stale-`from` `403` (Step 3.5 / [[resend-best-practice]] Rule 5a):
+     ```bash
+     aws lambda update-function-configuration --function-name flight-fare-notification \
+       --environment "Variables={CACHE_BUST=$(date +%s)}" --region us-east-1
+     ```
+  2. **Invoke with the REAL event shape** — `flight-fare-notification` reads an SQS-style body and needs `cheapest` (missing it → `KeyError`). The AWS MCP `lambda invoke` is **raw-input** (do **not** base64 the payload; and **don't** add `--query`/`--log-type` — the MCP errors on the streaming `Payload` even though the function still runs):
+     ```bash
+     aws lambda invoke --function-name flight-fare-notification --region us-east-1 \
+       --payload '{"Records":[{"body":"{\"email\":\"<non-owner>@example.com\",\"route\":\"TPE-TYO\",\"cheapest\":{\"price\":9531,\"depart_date\":\"2026-07-15\"},\"cheapest_usd\":{\"price\":295}}"}]}' \
+       /tmp/out.json
+     ```
+  3. **Verify by reading CloudWatch logs** (not the invoke output — the MCP can't read that file). Look for `RESEND_OK 200 → <non-owner>`:
+     ```bash
+     aws logs filter-log-events --log-group-name /aws/lambda/flight-fare-notification \
+       --query "events[].message" --region us-east-1
+     ```
+     A `403 validation_error` here → the domain isn't actually Verified (fix B1), or you skipped the cache-bust (step 1).
+  4. **Clean up the dedup row** so a real future alert isn't suppressed for 24h — delete the `notification_history` row this test wrote (`pk = "<email>#<route>"`, range key `sent_at`):
+     ```bash
+     aws dynamodb delete-item --table-name notification_history --region us-east-1 \
+       --key '{"pk":{"S":"<non-owner>@example.com#TPE-TYO"},"sent_at":{"S":"<the sent_at it wrote>"}}'
+     ```
 
-### Section D — Security & config
-- **D1** CORS is locked to the real domain (not `*`):
+### Section D — Config
+- **D3** **Secrets consistent** for the chosen mode:
+  - `flight/resend` — `from` is your domain (overlaps B2) and `api_key` is set.
+  - `flight/ecpay` — `merchant_id`/`hash_key`/`hash_iv` are all **stage** *or* all **prod** (never mixed), and `env` matches the cashier host (`stage` → `payment-stage…`, `prod` → `payment.ecpay.com.tw`). Staying on the stage merchant is fine — just confirm it's internally consistent. (Switching to a real merchant is the optional [[ecpay-go-live]].)
   ```bash
-  aws apigatewayv2 get-api --api-id <ApiId> --region us-east-1 --query 'CorsConfiguration.AllowOrigins'
+  aws secretsmanager get-secret-value --secret-id flight/ecpay --region us-east-1 \
+    --query SecretString --output text
   ```
-  Should list `https://yourdomain.com`, not `*`.
-- **D2** No AWS credentials in the front-end bundle — the browser only hits API Gateway; only the Lambda (IAM role) touches DynamoDB. (Grep the deployed site / repo for `AKIA`, `aws_secret`, `service_role` → all must be absent. The Supabase **publishable** key is OK; the service-role key and any AWS key are NOT.)
-- **D3** Secrets are the right ones for the chosen mode — `flight/ecpay` consistent (`env` matches the cashier host; `merchant_id`/`hash_key`/`hash_iv` all stage **or** all prod, never mixed).
-
-### Section E — Data hygiene
-- **E1** No test rows in production tables:
-  ```bash
-  aws dynamodb scan --table-name subscriptions \
-    --filter-expression 'contains(email, :t)' --expression-attribute-values '{":t":{"S":"test"}}' \
-    --region us-east-1 --query 'Count'
-  ```
-  Should be empty (clean out `checklist@test.com`, `e2e@test.com`, etc.).
-- **E2** The 3 starter routes still fetch real prices (`flight_price_history` has fresh rows).
-
-### Section F — Final smoke test (a real user journey)
-- **F1** On `https://yourdomain.com`: sign up → subscribe a route with a target above the live fare → pay (ECPay; stage card if not yet prod) → the browser returns via the `flight-ecpay-result` redirect (a clean success page, **not a 405**) → the row flips `active` → price-check runs → **an alert email from `@yourdomain.com` arrives at a real (non-owner) inbox**. End-to-end, on the real domain.
 
 ## Reporting
 
 | Item | Status | Notes |
 |---|---|---|
-| A1 apex HTTPS 200 | ✅/❌ | |
-| A2 www resolves | ✅/❌ | |
-| A3 valid TLS | ✅/❌ | |
-| B1 Resend verified | ✅/❌ | |
-| B2 from = your domain | ✅/❌ | |
-| B3 inbox, from domain | ✅/⚠️ | likely ⚠️ first |
-| B4 reaches a non-owner inbox | ✅/❌ | sandbox-lift proof |
-| C1 ECPay checkout on domain | ✅/❌ | |
-| C2 callbacks resolve + `1\|OK` | ✅/❌ | ReturnURL/PeriodReturnURL |
-| C3 stage/prod mode consistent | ✅/❌ | |
-| D1 CORS locked | ✅/❌ | |
-| D2 no AWS/service-role key in FE | ✅/❌ | critical |
-| D3 secrets correct | ✅/❌ | |
-| E1 no test data | ✅/⚠️ | |
-| E2 fresh prices | ✅/❌ | |
-| F1 full journey on domain | ✅/❌ | the launch gate |
+| A1 site serves HTTPS 200 on the domain | ✅/❌ | |
+| B1 Resend domain Verified | ✅/❌ | SPF + DKIM |
+| B2 `from` = your domain | ✅/❌ | |
+| B3 reaches a non-owner inbox | ✅/❌ | sandbox-lift proof |
+| D3 secrets consistent | ✅/❌ | resend `from` + ecpay all-stage/all-prod |
 
 **Verdict:**
-- All ✅ → 「🎉 上線檢查全過，可以正式開張！產品掛在你自己的網域與品牌上了。」（若想再加亮點：『啟動 M4』自架一台真的 OpenClaw 當 24 小時 AI 機票客服。）
-- Any ❌/⚠️ → list each with its fix (B3 spam → finish DKIM/SPF; B4 403 → domain not actually Verified; C2 callback fails → check CMV/`1|OK`; D1 → tighten CORS; D2 → remove key from front-end; E1 → delete test rows) and tell the student to fix then re-run `上線檢查`.
+- All ✅ → 「🎉 網域與寄信都掛在你自己的品牌上、API 也認得新網域，M3 完成！」（想再加亮點：『啟動 M4』自架一台真的 OpenClaw 當 24 小時 AI 機票客服。）
+- Any ❌ → fix and re-run `上線檢查`: B1 not Verified → check the SPF/DKIM DNS records; B3 `403` → domain not actually Verified (B1); D3 mixed stage/prod → align `merchant_id`/keys/`env` to one mode.
