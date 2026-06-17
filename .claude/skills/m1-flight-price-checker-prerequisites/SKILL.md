@@ -11,6 +11,16 @@ description: One-time setup before Milestone 1 of the Flight Price Notifier cour
 
 > ⚠️ **Don't assume the secret *name*.** M0 is run by an AI in a separate session, and **the name it chose is not guaranteed** — it might be `flight/github`, `flight-price-notifier/github`, `github-pat`, etc. So **never** rely on a hard-coded `describe-secret --secret-id flight/github`: an exact-name miss does **not** mean the secret is absent — it usually means it's stored under a different name. **Discover by listing + scanning** (below), and only treat a credential as missing after the scan finds nothing.
 
+## Architecture (what these credentials unlock)
+
+![Flight Fare / Notification architecture (M1) — Cowork pushes to the GitHub repo, which deploys the Vercel Product Site (Supabase auth). The Flight Fare Checker group: EventBridge → Parser Wrapper → Parser (×N) reads Flight Routes [S3] + the 3rd-party travelpayouts API and scans Subscriptions [DynamoDB]; matches go to SQS. The Notification group: Flight Fare Notification Lambda dedups against Notification History [DynamoDB] and sends via Email [Resend]. Legend: orange = manual input, teal = main component, pink = user data.](assets/flight-notification-architecture-m1.png)
+
+The four credentials you confirm/collect here are what make this diagram run:
+- **GitHub PAT** (M0 carryover) → the `Cowork → Repo (GitHub) → Product Site (Vercel)` push loop on the left.
+- **Supabase** url + publishable key (M0 carryover) → the `Database [Supabase]` auth behind the Product Site.
+- **Travelpayouts** token (new) → the `3rd-party Parser API [travelpayouts]` the `Parser` Lambdas call.
+- **Resend** key (new) → the `Email [Resend]` box the `Flight Fare Notification` Lambda sends through.
+
 ## How to run this (read first)
 
 - **Discover-then-reuse, ask only if genuinely absent.** For each M0 carryover, run **`list-secrets`** and scan the names for an obvious candidate (e.g. anything containing `github` / `supabase`); confirm by reading it and checking the **shape** (a `pat` field for GitHub, a `url`+`publishable_key`/`anon_key` for Supabase). If found → "✅ already cached from M0 — reusing" and move on. **Only if the scan turns up nothing** do you ask the student to paste it. (This is [[aws-best-practice]] Rule 2's check-then-collect, but name-agnostic — biased toward *reuse* because M0 already did the work.)

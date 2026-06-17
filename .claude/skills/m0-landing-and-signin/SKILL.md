@@ -52,6 +52,16 @@ If any of these is missing, **stop and ask the student to register first.**
 
 M0 builds **Flight Price Notifier** — fixed, no per-student variation. The v1 is a real, working signed-in SaaS: the landing page sells 「設定航線與目標價，機票降價就通知你」, and the Sign In / Sign Up button leads to a working auth flow. After signing in, the user lands on a placeholder authenticated page (e.g. 「Hi {email}，你的航線追蹤儀表板即將上線」). The subscribe form and price engine come in M1.1+.
 
+## Architecture
+
+![Flight Fare Checker architecture (M0) — the student drives Cowork (claude code), which pushes to the GitHub repo; from the repo the code flows out to the Vercel-hosted Product Site and the Supabase database. The Lovable landing page is crossed out because M0 migrates OFF Lovable Cloud onto Vercel + the student's own Supabase.](assets/flight-notification-architecture-m0.png)
+
+How the diagram maps to M0:
+- **You → Cowork (claude code) → Repo (GitHub):** the student drives Cowork; Cowork recalls the cached GitHub token (Step 6) and pushes to the repo (Step 7).
+- **Repo → Product Site (Vercel host):** the repo auto-deploys to Vercel on every push (Step 8) — the live `▲` Product Site.
+- **Repo → Database (Supabase):** the front-end talks to the student's own Supabase project for `auth.users` after the swap (Step 9).
+- **Landing Page (Lovable), crossed out:** Lovable generates v1 (Steps 1–3), but M0 **migrates off** Lovable Cloud — hosting moves to Vercel and auth moves to the student's Supabase. Lovable stays only as the upstream generator/two-way-sync, not as the runtime backend.
+
 ## Conversational flow
 
 You (Claude Code) drive the student through **10 steps**, in order. Don't dump them all at once — after each step, **wait for confirmation** before moving on.
