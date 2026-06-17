@@ -138,7 +138,7 @@ This is the standard way to land bytes in S3 from an `aws`-only connector — fo
 | `flight/ecpay` | `{"merchant_id":"…","hash_key":"…","hash_iv":"…","env":"stage|prod","amount":"…"}` | M2 | **Lambda runtime** (checkout + callbacks + cancel) |
 | `flight/telegram` | `{"bot_token":"…"}` | M4 | **Lambda runtime** (chat) |
 | `flight/anthropic` | `{"api_key":"sk-ant-…"}` | M4 | **Lambda runtime** (chat) |
-| `flight/github` | `{"pat":"github_pat_…"}` | M1.1 prereq | **session bootstrap** — the Cowork git tool, to push |
+| `flight/github` | `{"pat":"github_pat_…"}` or bare string | M0 (Step 6) | **session bootstrap** — the Cowork git tool, to push (M1.1 prereq just discovers it) |
 | `flight/supabase` | `{"url":"…","publishable_key":"…"}` | M0 | **session recall** — the front-end build env (publishable key is **public by design**) |
 
 **Two kinds of secret, treated the same way for storage but not for sensitivity:**
