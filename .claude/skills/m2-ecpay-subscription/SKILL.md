@@ -24,6 +24,10 @@ End state: a test payment flips a row `pending_payment → active` (and it start
 
 > **Why ECPay, not Stripe?** This course targets a Taiwan audience charging in **TWD**. ECPay (綠界) is the standard local gateway and the one the instructor runs in production. The *shape* of M2 is identical to a Stripe paywall — payment flips a status field, a verified callback is the source of truth, the parser gates on `active` — but ECPay's mechanics differ in four ways you must learn (see "Things to watch out for"): **two callbacks instead of one webhook**, **CheckMacValue instead of a signature header**, **cancel is an API call you make, not an event you receive**, and **no SDK/layer needed** (CMV is stdlib `hashlib`).
 
+## Architecture
+
+![Flight Fare / Notification architecture (M2) — M2 adds the payment layer on top of the M1 notifier. The Product Site [Vercel] POSTs to the ECPay Lambda Handlers (flight-ecpay-return / flight-ecpay-period / flight-cancel-subscription), which talk to ECPay and write the subscription_status onto Subscriptions [DynamoDB]; a "subscription check" gate on that table is what makes the Parser scan only active rows. On payment events the handlers enqueue to the Notification-side SQS, where the Subscription Status Notification Lambda emails welcome/cancel via Resend. The M1 flow stays: EventBridge → Parser Wrapper → Parser (×N) reads Flight Routes [S3] + the 3rd-party travelpayouts API, scans Subscriptions, and enqueues matches to the Flight Fare Notification SQS → Flight Fare Notification Lambda dedups against Notification History [DynamoDB] and emails via Resend. Inset: the subscribe → ECPay → callback (W = write) loop that flips subscription_status. Legend: orange = manual input, teal = main component, pink = user data.](assets/flight_notification_structure2.jpg)
+
 ## When to load this skill
 
 - "啟動 M2" / "start M2" / "接金流" / "接綠界" / "接 ECPay" / "做訂閱付款"
