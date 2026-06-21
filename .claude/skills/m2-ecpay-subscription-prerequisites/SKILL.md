@@ -57,10 +57,10 @@ This shared backoffice is what lets you press **模擬付款** and open **信用
 ```bash
 aws secretsmanager describe-secret --secret-id flight/ecpay --region us-east-1 --query "Name" 2>/dev/null \
   || aws secretsmanager create-secret --name flight/ecpay \
-       --secret-string '{"merchant_id":"3002607","hash_key":"pwFHCqoQZGmho4w6","hash_iv":"EkRm7iFT261dpevs","env":"stage","amount":"150"}' \
+       --secret-string '{"merchant_id":"3002607","hash_key":"pwFHCqoQZGmho4w6","hash_iv":"EkRm7iFT261dpevs","env":"stage","amount":"300"}' \
        --region us-east-1
 ```
-Set `amount` to your intended TWD monthly price (integer; e.g. `150` = NT$150). Keep it a realistic amount — ECPay hides credit-card payment below the card minimum (~NT$6–11), so don't use NT$1.
+`amount` is our **implemented monthly price: `300` (NT$300)**. Students can later set it to any integer TWD value they want — everything downstream reads it from this secret, so the price is a one-line change with no code edits. Keep it realistic — ECPay hides credit-card payment below the card minimum (~NT$6–11), so don't use NT$1.
 
 **Verify:**
 ```bash

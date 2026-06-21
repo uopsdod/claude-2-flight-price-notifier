@@ -26,7 +26,7 @@ Run each check and report. Ask the student for: the API Gateway base URL, the li
 Subscription rows are the authoritative source — read them with `aws dynamodb get-item` (works identically via the AWS API MCP).
 
 ### Section A — ECPay checkout form
-- **A1** The `flight/ecpay` secret exists with stage `merchant_id` + an `amount`: `aws secretsmanager get-secret-value --secret-id flight/ecpay --region us-east-1 --query SecretString --output text`.
+- **A1** The `flight/ecpay` secret exists with stage `merchant_id` + an `amount` (our implemented price is `300` = NT$300; any integer the student chose is acceptable): `aws secretsmanager get-secret-value --secret-id flight/ecpay --region us-east-1 --query SecretString --output text`.
 - **A2** `POST /subscribe` returns an **auto-submit HTML form** whose `action` is the ECPay cashier and that contains a `CheckMacValue` hidden field + `PeriodType`/`PeriodAmount`. **Mode-dependent:**
   - **CLI:**
     ```bash
