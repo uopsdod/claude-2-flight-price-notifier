@@ -9,6 +9,10 @@ description: Prerequisites before M3 of the Flight Price Notifier course — a d
 
 M3 adds one thing: a **domain (or subdomain) you control**. Its DNS may live in **Route 53** (manage it directly via the AWS MCP — the smoothest path) or an **external registrar** (Namecheap/Cloudflare/GoDaddy). Everything else carries over from M2 (the live-on-Vercel paid product). This skill identifies the domain + where its DNS lives, and confirms the M2 carryover.
 
+## Architecture
+
+![Flight Fare / Notification architecture (M3) — the full M2 system the domain (these prerequisites identify) gets bound onto in two places. The Product Site is relabeled [domain].com (Vercel host) instead of *.vercel.app — that relabel IS the M3 change. The Product Site POSTs to the ECPay Lambda Handlers (flight-ecpay-return / flight-ecpay-period / flight-cancel-subscription), which write subscription_status onto Subscriptions [DynamoDB]; a "subscription check" gate on that table makes the Parser scan only active rows. On payment events the handlers enqueue to the Notification-side SQS, where the Subscription Status Notification Lambda emails welcome/cancel via Resend — bound to alerts@[domain].com in M3. The notifier flow: EventBridge → Parser Wrapper → Parser (×N) reads Flight Routes [S3] + the travelpayouts API, scans Subscriptions, enqueues matches to the Flight Fare Notification SQS → Flight Fare Notification Lambda dedups against Notification History [DynamoDB] and emails via Resend. The two places M3 binds the domain — the Product Site box and the Resend email sender — are the only edges that change. Inset: the subscribe → ECPay → callback (W = write) loop. Legend: orange = manual input, teal = main component, pink = user data.](assets/flight_notification_structure2.jpg)
+
 ## When to load this skill
 
 - "M3 環境準備" / any time M3 detects the domain or the M2 product is missing.

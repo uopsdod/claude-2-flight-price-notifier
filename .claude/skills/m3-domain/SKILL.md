@@ -22,7 +22,7 @@ End state of this skill: the Vercel domain + the Resend sending domain are **set
 
 ## Architecture (where M3 fits)
 
-![Flight Notification architecture — the Product Site now serves on your own [domain].com; ECPay Lambda Handlers run the callbacks; emails go out via Resend](assets/flight-notification-architecture.jpg)
+![Flight Fare / Notification architecture (M3) — the full M2 system with the custom domain bound. The Product Site is now labeled [domain].com (Vercel host) instead of *.vercel.app — that relabel IS the M3 change. The Product Site POSTs to the ECPay Lambda Handlers (flight-ecpay-return / flight-ecpay-period / flight-cancel-subscription), which talk to ECPay and write subscription_status onto Subscriptions [DynamoDB]; a "subscription check" gate on that table makes the Parser scan only active rows. On payment events the handlers enqueue to the Notification-side SQS, where the Subscription Status Notification Lambda emails welcome/cancel via Resend (now from alerts@[domain].com). The notifier flow: EventBridge → Parser Wrapper → Parser (×N) reads Flight Routes [S3] + the 3rd-party travelpayouts API, scans Subscriptions, and enqueues matches to the Flight Fare Notification SQS → Flight Fare Notification Lambda dedups against Notification History [DynamoDB] and emails via Resend. Inset: the subscribe → ECPay → callback (W = write) loop that flips subscription_status. Legend: orange = manual input, teal = main component, pink = user data.](assets/flight_notification_structure2.jpg)
 
 M3 changes only the **outer edges** of this diagram, not the flow:
 - **`[domain].com` Product Site** (top-left) — Step 2 binds your custom domain to the Vercel-hosted front-end (instead of `*.vercel.app`).

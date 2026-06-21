@@ -11,6 +11,10 @@ Confirms the things M3 actually changes are live: **(1) the site is on your cust
 
 > **Scope note.** This checklist is deliberately scoped to the **domain + email cutover** — the things M3 introduces. It does **not** re-run the payment journey or grep the front-end bundle: M3 doesn't touch the payment path (the ECPay callbacks stay on the API Gateway URL and are hit server-to-server), so payments are an M2 concern ([[m2-ecpay-subscription-checklist]]), and the front-end secret-hygiene check belongs to general launch prep. Run those separately if you need a full launch audit.
 
+## Architecture
+
+![Flight Fare / Notification architecture (M3) — this checklist verifies the custom-domain cutover on the full M2 system. The Product Site is now labeled [domain].com (Vercel host) instead of *.vercel.app — that relabel IS what M3 changes. The Product Site POSTs to the ECPay Lambda Handlers (flight-ecpay-return / flight-ecpay-period / flight-cancel-subscription), which write subscription_status onto Subscriptions [DynamoDB]; a "subscription check" gate on that table makes the Parser scan only active rows. On payment events the handlers enqueue to the Notification-side SQS, where the Subscription Status Notification Lambda emails welcome/cancel via Resend — now from alerts@[domain].com, which lifts the M2 sandbox limit so it reaches any inbox (Section B verifies exactly this). The notifier flow: EventBridge → Parser Wrapper → Parser (×N) reads Flight Routes [S3] + the travelpayouts API, scans Subscriptions, enqueues matches to the Flight Fare Notification SQS → Flight Fare Notification Lambda dedups against Notification History [DynamoDB] and emails via Resend. Inset: the subscribe → ECPay → callback (W = write) loop. Legend: orange = manual input, teal = main component, pink = user data.](assets/flight_notification_structure2.jpg)
+
 ## Execution mode
 
 CLI uses `curl`/`aws`; Cowork uses dashboards/MCP. `aws` commands `--region us-east-1`.
