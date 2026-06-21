@@ -17,24 +17,31 @@ M3 adds one thing: a **domain (or subdomain) you control**. Its DNS may live in 
 
 - "M3 環境準備" / any time M3 detects the domain or the M2 product is missing.
 
-## Step 1 — Identify the domain and WHERE its DNS lives (check Route 53 FIRST, then ask)
+## Step 1 — Auto-detect the domain, its DNS home, and the host to bind (don't ask)
 
-M3 uses **one** domain (or subdomain) in two places: the **Vercel site** AND the **Resend email sender** (`alerts@<host>`). Before anything else, find out **where its DNS is managed**, because that decides whether you (the agent) edit DNS directly or hand records to the student.
+M3 uses **one** domain (or subdomain) in two places: the **Vercel site** AND the **Resend email sender** (`alerts@<host>`). Discover everything you can yourself first — **the goal is to proceed without prompting**, because every confirmation round delays the run.
 
-**Check Route 53 first** (via the AWS MCP) — the domain may well be an AWS-hosted zone you can manage end-to-end:
+**Auto-list the Route 53 zones** (via the AWS MCP) — the domain is usually an AWS-hosted zone you can manage end-to-end:
 ```bash
 aws route53 list-hosted-zones --query "HostedZones[].{name:Name,id:Id,private:Config.PrivateZone}"
-# match a zone whose Name == "<their-domain>." (note the trailing dot)
+# a public zone whose Name == "<domain>." (trailing dot) is the one you'll edit
 ```
 
-| Outcome | What it means → what to do |
-|---|---|
-| A **public** zone matches the domain | ✅ DNS is in Route 53 — **you can add every Vercel/Resend record yourself** via `aws route53 change-resource-record-sets` (`UPSERT`). No registrar panel, no guessing. Note the `HostedZoneId`. |
-| **No** matching zone | The domain is at an external registrar / Cloudflare / Vercel DNS. **Ask the student** for the domain and have them (or you, if they grant access) add records there. |
-| A **private** zone matches | Internal-VPC zone — ignore it for go-live; treat as "no public zone." |
-| A zone matches but the student says they don't own it | Possible typo, or someone else's zone in a shared account — **pause and confirm** before binding anything. |
+Then act on what you find — **no decision table to walk the student through, just pick and state it:**
 
-> **Don't assume the domain is un-lookable.** (An earlier version of this skill claimed "AWS has no record of it, you must ask." That's only true when DNS is *external* — when the domain is a Route 53 hosted zone, it's fully discoverable and editable through the MCP, which is the smoother path. Check first.)
+- **Exactly one owned public zone** → that's the domain; DNS is in Route 53, so you add every Vercel/Resend record yourself via `aws route53 change-resource-record-sets` (`UPSERT`). Note the `HostedZoneId` and move on.
+- **No public zone matches** → DNS is external (registrar / Cloudflare / Vercel DNS). This is the *one* genuinely un-discoverable case — get the domain string from the student and hand them the records to add. (Private/internal-VPC zones don't count — ignore them, treat as "no public zone.")
+- **Multiple owned public zones, truly ambiguous** → the only case worth a question. Even then, **don't block: pick the most plausible one, state your choice ("Using `<domain>` — say so if you meant another"), and continue.** A wrong guess is cheap to correct; a blocking prompt stalls the whole run.
+
+**Auto-detect whether the apex is in use** (drives the host choice below — also self-serve, don't ask):
+```bash
+# any existing apex A / www CNAME / other project records in the zone = apex is in use
+aws route53 list-resource-record-sets --hosted-zone-id <id> \
+  --query "ResourceRecordSets[?Name=='<domain>.' || Name=='www.<domain>.'].{name:Name,type:Type}"
+```
+Existing apex `A` / `www` `CNAME` (or any live project records) → **apex is in use** → bind a subdomain (the default anyway, below).
+
+> **Don't assume the domain is un-lookable.** (An earlier version claimed "AWS has no record of it, you must ask." That's only true when DNS is *external* — a Route 53 zone is fully discoverable and editable through the MCP. List first; only the external-DNS case needs the student.)
 
 ### ⚠️ Multi-account: the Route 53 zone may be in a DIFFERENT AWS account than the flight resources
 
@@ -43,11 +50,11 @@ The AWS MCP uses a single `[default]` profile. In a real setup the **domain (Rou
 - Which account/profile holds **`flight/*` secrets + the Lambdas + `flight-api`** → used for the `put-secret-value`, cold-start, etc.
 - For a **student** this is usually **one** account — flag the two-account case as the advanced variant. (See [[aws-best-practice]].)
 
-### ⚠️ Shared / in-use domain: bind a SUBDOMAIN, never clobber the apex
+### Bind a SUBDOMAIN by default — don't ask, never clobber the apex
 
-If the apex (`yourdomain.com`) and `www` are **already serving another project**, do **not** overwrite their records. Bind a **dedicated subdomain** for the flight site instead — e.g. `fly.yourdomain.com` for the site and `mail.yourdomain.com` (or `fly-notify.yourdomain.com`) for the Resend sender. Every DNS write is an **`UPSERT`/append**, never a blind overwrite — multi-value records (like `_vercel` TXT) must be appended to, not replaced (see [[m3-domain]] Step 2). Decide the exact host(s) here so the later steps use them consistently.
+**Default to a dedicated subdomain** for the flight project — `fly.yourdomain.com` for the site and `mail.yourdomain.com` for the Resend sender — **even when the apex is free, and without asking the student.** It avoids clobbering another project on the same domain, sidesteps the apex-`A` record and the "same apex verified in two Resend accounts" collision, and — the big one — **doesn't force the student to re-verify a domain they may already have set up, which would delay the build** (see [[m3-domain]] Step 1/3). Every DNS write is an **`UPSERT`/append**, never a blind overwrite — multi-value records (like `_vercel` TXT) must be appended to, not replaced (see [[m3-domain]] Step 2). Only use the bare apex if the student explicitly asks for it. Decide the exact host(s) here so the later steps use them consistently.
 
-**Verify:** you know (a) the exact host(s) you'll bind (apex or a subdomain), and (b) where their DNS lives (Route 53 account/profile, or an external registrar the student can edit).
+**Verify:** you know (a) the exact host(s) you'll bind (a subdomain by default), and (b) where their DNS lives (Route 53 account/profile, or an external registrar the student can edit).
 
 ## Step 2 — Confirm M2 carryover (the product works on the Vercel URL)
 
@@ -67,7 +74,8 @@ Confirm access to: **DNS** (the Route 53 account/profile **or** the external reg
 
 ## Verify (all must pass)
 
-- The exact host(s) to bind are decided (apex, or a dedicated subdomain if the apex is in use) ✅
+- **Host is auto-selected** (subdomain — `fly.<domain>` — by default, and always when the apex is in use); **do not prompt for confirmation — it delays the run** ✅
+- The exact host(s) to bind are decided (a subdomain by default; bare apex only if the student explicitly asked) ✅
 - You know where the DNS lives and can edit it — Route 53 (via MCP) **or** an external registrar ✅
 - If domain and project are in **different AWS accounts**, you've identified which profile to use for DNS vs. for secrets/Lambdas ✅
 - Vercel URL returns 200 with the paid product ✅

@@ -49,7 +49,9 @@ DNS + dashboards mostly (Vercel, Resend, registrar). `vercel` CLI / MCP for doma
 
 ### Step 1 — Confirm the host(s) and where DNS lives
 
-From `m3-domain-prerequisites` you already know: the **exact host(s)** to bind (apex `yourdomain.com`, or a dedicated **subdomain** like `fly.yourdomain.com` if the apex is already in use by another project) and **where the DNS is** (a **Route 53** hosted zone you edit via the AWS MCP, or an external registrar). Carry those forward.
+> **Default to a SUBDOMAIN, not the apex — and don't ask.** Bind a dedicated subdomain for both the site (`fly.yourdomain.com`) and email (`mail.yourdomain.com`) **by default**, even when the apex is free. Reasons: it never collides with another project on the same domain, it sidesteps the apex-`A`-record and the "verify the same apex in two accounts" problems (Step 3), and — most importantly — **it avoids forcing the student to re-verify a domain they may already have set up, which delays the build.** Pick sensible subdomains and proceed; only fall back to the apex if the student explicitly asks for a bare `yourdomain.com`.
+
+From `m3-domain-prerequisites` you already know **where the DNS is** (a **Route 53** hosted zone you edit via the AWS MCP, or an external registrar). Carry that forward and use the subdomain hosts above.
 
 > **DNS edits in Route 53:** every record below is an **`UPSERT`** via `aws route53 change-resource-record-sets --hosted-zone-id <id> --change-batch '{…}'` — never a blind create that could clobber an existing record. **Multi-value records (TXT) must include ALL existing values plus the new one** in a single `UPSERT` (Route 53 replaces the whole record set). If the zone is in a different AWS account than the flight project, switch the `[default]` profile to the **domain account** for these steps.
 
@@ -57,25 +59,26 @@ From `m3-domain-prerequisites` you already know: the **exact host(s)** to bind (
 
 ⚠️ **Cowork: adding the domain to the project is a MANUAL dashboard step** — there's no Vercel-domain MCP tool. The student does: **Vercel dashboard → Project → Settings → Domains → Add** `<your host>`. (CLI users can `vercel domains add <host>`.)
 
-Then Vercel **displays the exact DNS records to create** — read them off the dashboard and create them in DNS. The records depend on whether you bind an apex or a subdomain, and **whether the host was ever linked to another Vercel account**:
+Then Vercel **displays the exact DNS records to create** — read them off the dashboard and create them in DNS. With the **subdomain default** (Step 1), this is a single `CNAME`; the records also depend on **whether the host was ever linked to another Vercel account**:
 
-- **Apex** → an `A` record to Vercel's anycast IP (Vercel shows it). **Subdomain** → a `CNAME`. ⚠️ **Use the EXACT CNAME target Vercel gives you** — for a previously-linked host it's often a **project-specific** target like `…vercel-dns-017.com`, **not** the generic `cname.vercel-dns.com`.
+- **Subdomain (default)** → a `CNAME`. ⚠️ **Use the EXACT CNAME target Vercel gives you** — for a previously-linked host it's often a **project-specific** target like `…vercel-dns-017.com`, **not** the generic `cname.vercel-dns.com`. (Only if the student insisted on the **apex** → an `A` record to Vercel's anycast IP, which Vercel shows.)
 - **If the host was linked elsewhere before**, Vercel also demands a **`_vercel` TXT** ownership record (`vc-domain-verify=…`). ⚠️ **`_vercel` TXT is multi-value** — if it already holds a verify token for another subdomain, you must **append** the new value, not overwrite (in Route 53, `UPSERT` the `_vercel` TXT with **both** values).
 
 After the records propagate, Vercel shows the domain **Valid/active** and issues a TLS cert automatically.
 
-### Step 3 — Set up your Resend sending domain (subdomain if the apex is taken)
+### Step 3 — Set up your Resend sending domain (use a subdomain by default)
 
-⚠️ **You CANNOT verify the same apex in two Resend accounts.** Resend's DKIM selector is `resend._domainkey.<apex>` — if that apex is already verified in **another** Resend account (e.g. a different project of yours), the selector **collides** and verification fails. The fix is a **dedicated sending subdomain**.
+⚠️ **You CANNOT verify the same apex in two Resend accounts.** Resend's DKIM selector is `resend._domainkey.<apex>` — if that apex is already verified in **another** Resend account (e.g. a different project of yours), the selector **collides** and verification fails. **This is exactly why Step 1 defaults to a dedicated sending subdomain** — use **`mail.yourdomain.com`**, don't ask, and you avoid the collision entirely.
 
-1. Resend → **Domains → Add Domain**. Enter **`mail.yourdomain.com`** (a sending subdomain) **if** the apex is shared/already-used elsewhere; otherwise the apex is fine.
+1. Resend → **Domains → Add Domain**. Enter **`mail.yourdomain.com`** (the default sending subdomain from Step 1).
 2. Add the **exact** records Resend displays. For a sending subdomain `send.<sub>` they're typically:
    - **DKIM** — `TXT` at `resend._domainkey.<sub>` (the long `p=…` key)
    - **MX** — `send.<sub>` → `10 feedback-smtp.<region>.amazonses.com`
    - **SPF** — `TXT` at `send.<sub>` → `v=spf1 include:amazonses.com ~all`
    - (optionally a DMARC `TXT` at `_dmarc.<sub>`)
    Create them in DNS (Route 53 `UPSERT`, or the registrar).
-3. Wait for Resend to show the domain/subdomain **Verified**.
+3. **⚠️ Tell the student (imperatively): open `resend.com` → Domains → `fly.<domain>` → click the「Verify Domain」button, then report back.** Resend does **not** auto-verify, and **the agent cannot read or trigger Resend's status — there is no Resend MCP/CLI tool.** So you can't poll it: after the DNS records are in, the student must click Verify themselves (re-click after a minute if DNS hasn't propagated) and tell you they did. The build stalls at "not verified" until they do.
+   > **Verification signal you CAN see (don't wait on the dashboard):** since you can't read Resend's "Verified" badge, treat the **first real send** as the proof — a **`200` from the Resend POST is the de-facto "Verified"** (Step 3.5 sends one). A **`403 validation_error` means not-yet-verified** (or a stale-`from` cache — Step 5). So: have the student click Verify, then just **send** and read the status code; don't block on a dashboard state the agent can't observe.
 4. **Only after Verified**, flip the secret to send from your (sub)domain — using the **project account's** profile if multi-account:
 ```bash
 aws secretsmanager put-secret-value --secret-id flight/resend \
@@ -88,8 +91,18 @@ aws lambda update-function-configuration --function-name flight-fare-notificatio
   --environment "Variables={CACHE_BUST=$(date +%s)}" --region us-east-1
 ```
 (Any env-var change forces a fresh container that re-reads the secret. Same applies to `flight-status-notification` if it reads `flight/resend`.)
+6. **Smoke-send once → the `200`/`403` is your verification signal** (you can't read Resend's dashboard). Invoke the sender with a **real SQS-shaped event** — `flight-fare-notification` reads `msg["target_price"]` (and `cheapest`), so **include `target_price`** or it throws `KeyError: 'target_price'`:
+```bash
+aws lambda invoke --function-name flight-fare-notification --region us-east-1 \
+  --payload '{"Records":[{"body":"{\"email\":\"<non-owner>@example.com\",\"route\":\"TPE-TYO\",\"target_price\":10000,\"cheapest\":{\"price\":9531,\"depart_date\":\"2026-07-15\"},\"cheapest_usd\":{\"price\":295}}"}]}' \
+  /tmp/out.json
+# read the result in CloudWatch (the MCP can't cat the invoke output):
+aws logs filter-log-events --log-group-name /aws/lambda/flight-fare-notification \
+  --query "events[].message" --region us-east-1
+```
+`RESEND_OK 200` → domain is effectively **Verified**, sandbox lifted. `403 validation_error` → not-yet-verified (have the student click Verify, step 3) or a stale cache (step 5). *(This is the same send the checklist's B3 runs — clean up its `notification_history` dedup row afterward so a real alert isn't suppressed; see [[m3-domain-checklist]].)*
 
-> Don't flip the `from` secret before Resend shows **Verified** — a custom `from` on an unverified domain gets rejected / spam-foldered ([[resend-best-practice]] Rule 2). And remember the cache-bust (step 5) — it's the #1 "I updated the secret but it still 403s" trap.
+> Don't flip the `from` secret before the student has clicked **Verify Domain** (step 3) — a custom `from` on an unverified domain gets rejected / spam-foldered ([[resend-best-practice]] Rule 2). And remember the cache-bust (step 5) — it's the #1 "I updated the secret but it still 403s" trap.
 
 ### Step 4 — Verify
 
@@ -99,7 +112,7 @@ Setup is done. **Run [[m3-domain-checklist]]** (the student can say 「驗收 M3
 
 ## Things to watch out for (setup gotchas)
 
-1. **Bind a subdomain when the apex is in use** — if `yourdomain.com`/`www` already serve another project, don't clobber them; bind `fly.yourdomain.com` (site) + `mail.yourdomain.com` (email). For a fresh apex, add both apex + `www` and pick one canonical.
+1. **Default to a subdomain — don't ask** — bind `fly.yourdomain.com` (site) + `mail.yourdomain.com` (email) **by default**, even on a fresh domain (Step 1). It avoids clobbering another project, the apex-`A` record, the two-accounts Resend collision, **and re-verifying a domain the student already set up** (the delay we're avoiding). Only use the bare apex if the student explicitly asks.
 2. **Never overwrite multi-value records** — `_vercel` TXT and SPF/DKIM TXT can already hold other values; in Route 53 `UPSERT` the record set with **all** values (existing + new), or you'll break the other project's verification (Step 2/3).
 3. **Don't flip the Resend `from` secret before the domain is Verified** — rejected / spam until SPF+DKIM are live (Step 3).
 4. **Cache-bust after changing `flight/resend`** — the Lambda caches the secret in warm containers; force a cold start or you'll see a stale-`from` `403` even though the secret is right (Step 3.5). This is the #1 confusing trap.

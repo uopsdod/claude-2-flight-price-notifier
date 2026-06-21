@@ -9,6 +9,10 @@ description: Flight Price Notifier Milestone 2 verification — confirms the ECP
 
 Confirms the paywall really works end-to-end: recurring checkout → callback (CMV-verified) → `active`; cancel → `expired`; and the active-only gating actually controls who gets emailed. Emits `READY for M3`. Run after `m2-ecpay-subscription` Step 6.
 
+## Architecture
+
+![Flight Fare / Notification architecture (M2) — this checklist verifies the payment layer M2 adds on top of the M1 notifier. The Product Site [Vercel] POSTs to the ECPay Lambda Handlers (flight-ecpay-return / flight-ecpay-period / flight-cancel-subscription), which talk to ECPay and write subscription_status onto Subscriptions [DynamoDB]; a "subscription check" gate on that table is what makes the Parser scan only active rows. On payment events the handlers enqueue to the Notification-side SQS, where the Subscription Status Notification Lambda emails welcome/cancel via Resend. The M1 flow remains: EventBridge → Parser Wrapper → Parser (×N) reads Flight Routes [S3] + the travelpayouts API, scans Subscriptions, enqueues matches to the Flight Fare Notification SQS → Flight Fare Notification Lambda dedups against Notification History [DynamoDB] and emails via Resend. Inset: the subscribe → ECPay → callback (W = write) loop that flips subscription_status. Legend: orange = manual input, teal = main component, pink = user data.](assets/flight_notification_structure2.jpg)
+
 ## Execution mode
 
 Mainly **Cowork** — paste checks to the agent with the **AWS API MCP**; CLI runs the same `aws` lines. All commands `--region us-east-1`, `[default]` profile. MCP rules that bite here: **verify by effect** (can't `cat` an `invoke`/output file — read the DynamoDB row or the logs instead); **`filter-log-events`**, not `logs tail`; **no JMESPath backtick literals** (use `SecretList[].Name`, scan the list). There is **no `ecpay` CLI or MCP** — ECPay-side steps are driven from the **廠商後台** (模擬付款 button + 信用卡定期定額訂單查詢) and from a real **stage test-card** run in the browser. The `POST` checks (`/subscribe`, `/cancel`, `/ecpay-result`) are **mode-dependent**: Cowork can't POST (no shell with AWS net; the web tool is GET-only) → prove those by their **effect** (the DynamoDB row + the callback logs) and by driving the live form in the browser. CLI can run the `curl` lines directly.
@@ -22,7 +26,7 @@ Run each check and report. Ask the student for: the API Gateway base URL, the li
 Subscription rows are the authoritative source — read them with `aws dynamodb get-item` (works identically via the AWS API MCP).
 
 ### Section A — ECPay checkout form
-- **A1** The `flight/ecpay` secret exists with stage `merchant_id` + an `amount`: `aws secretsmanager get-secret-value --secret-id flight/ecpay --region us-east-1 --query SecretString --output text`.
+- **A1** The `flight/ecpay` secret exists with stage `merchant_id` + an `amount` (our implemented price is `300` = NT$300; any integer the student chose is acceptable): `aws secretsmanager get-secret-value --secret-id flight/ecpay --region us-east-1 --query SecretString --output text`.
 - **A2** `POST /subscribe` returns an **auto-submit HTML form** whose `action` is the ECPay cashier and that contains a `CheckMacValue` hidden field + `PeriodType`/`PeriodAmount`. **Mode-dependent:**
   - **CLI:**
     ```bash
@@ -40,6 +44,9 @@ Subscription rows are the authoritative source — read them with `aws dynamodb 
     ```
 
 ### Section B — Callbacks verify CMV + flip to active
+
+> **No card handy? Verify the callback path with a validly-signed synthetic callback (same-day).** The real cashier needs a human (card + OTP), but B2/B3 (and E1/D3 grace) can be proven **without a card** by POSTing a callback you sign yourself with the real `flight/ecpay` secret — `RtnCode=1`, `CustomField1=<email>`, `CustomField2=<route>`, **including the empty `CustomField3=&CustomField4=`**, `CheckMacValue` via `gen_cmv` (no `SimulatePaid`) — to the deployed `…/ecpay-return`, then assert the row flips to `active`. This catches CMV / empty-field / idempotency bugs early. It's a **backend** proof only (no cashier UI / `OrderResultURL`), so still do **one** real stage test-card run before signing off, and record the two separately (see [[ecpay-best-practice]] Rule 8). *(Cowork can't POST from the sandbox — run the signed POST from a throwaway Lambda or the CLI.)*
+
 - **B1** Both callback Lambdas exist — two separate calls (Cowork MCP runs one API call at a time, no shell loop): `aws lambda get-function --function-name flight-ecpay-return --region us-east-1 --query 'Configuration.FunctionName'` and `aws lambda get-function --function-name flight-ecpay-period --region us-east-1 --query 'Configuration.FunctionName'`.
 - **B2** CheckMacValue verification works (no rejects). Trigger the first-period callback via the stage 後台「模擬付款」 (or a real test-card run) and read the logs — use `filter-log-events` (Cowork MCP has no `logs tail`):
   ```bash
@@ -138,5 +145,6 @@ Subscription rows are the authoritative source — read them with `aws dynamodb 
   - 模擬付款 grants free access → guard `SimulatePaid` (Rule 7).
   - cancel does nothing → cancel is `CreditCardPeriodAction Action=Cancel` that **you** call, not an event you wait for (Rule 9). `90100150` on a never-paid order is expected.
   - emails not arriving → Resend sandbox only reaches your own account email (verify a domain at M3).
+  - **welcome/cancel email never arrives, log shows `403` with body `error code: 1010`** → the new `flight-status-notification` Lambda is POSTing to Resend **without a `User-Agent` header**, so Cloudflare (in front of `api.resend.com`) bans it. This is **not** an account/recipient issue — add a `User-Agent` to the POST and reuse M1's `_send`/headers ([[resend-best-practice]] Rule 4). Distinguish from the sandbox `validation_error` 403 by the `1010` code.
   
   then re-run `驗收 M2`.

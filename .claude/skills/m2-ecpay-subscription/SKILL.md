@@ -24,6 +24,10 @@ End state: a test payment flips a row `pending_payment → active` (and it start
 
 > **Why ECPay, not Stripe?** This course targets a Taiwan audience charging in **TWD**. ECPay (綠界) is the standard local gateway and the one the instructor runs in production. The *shape* of M2 is identical to a Stripe paywall — payment flips a status field, a verified callback is the source of truth, the parser gates on `active` — but ECPay's mechanics differ in four ways you must learn (see "Things to watch out for"): **two callbacks instead of one webhook**, **CheckMacValue instead of a signature header**, **cancel is an API call you make, not an event you receive**, and **no SDK/layer needed** (CMV is stdlib `hashlib`).
 
+## Architecture
+
+![Flight Fare / Notification architecture (M2) — M2 adds the payment layer on top of the M1 notifier. The Product Site [Vercel] POSTs to the ECPay Lambda Handlers (flight-ecpay-return / flight-ecpay-period / flight-cancel-subscription), which talk to ECPay and write the subscription_status onto Subscriptions [DynamoDB]; a "subscription check" gate on that table is what makes the Parser scan only active rows. On payment events the handlers enqueue to the Notification-side SQS, where the Subscription Status Notification Lambda emails welcome/cancel via Resend. The M1 flow stays: EventBridge → Parser Wrapper → Parser (×N) reads Flight Routes [S3] + the 3rd-party travelpayouts API, scans Subscriptions, and enqueues matches to the Flight Fare Notification SQS → Flight Fare Notification Lambda dedups against Notification History [DynamoDB] and emails via Resend. Inset: the subscribe → ECPay → callback (W = write) loop that flips subscription_status. Legend: orange = manual input, teal = main component, pink = user data.](assets/flight_notification_structure2.jpg)
+
 ## When to load this skill
 
 - "啟動 M2" / "start M2" / "接金流" / "接綠界" / "接 ECPay" / "做訂閱付款"
@@ -58,7 +62,7 @@ The detailed flow:
 訂閱表單 ─POST /subscribe─▶ save_subscription Lambda
                               · PutItem subscriptions（M2 起：status=pending_payment）
                               · 組 ECPay 定期定額 AIO 參數：
-                                  ChoosePayment=Credit, TotalAmount=PeriodAmount=<月費TWD>,
+                                  ChoosePayment=Credit, TotalAmount=PeriodAmount=300（NT$300 月費，讀自 flight/ecpay 的 amount）,
                                   PeriodType=M, Frequency=1, ExecTimes=999,
                                   ReturnURL=<api>/ecpay-return, PeriodReturnURL=<api>/ecpay-period,
                                   MerchantTradeNo=<unique>, CustomField1=email, CustomField2=route
@@ -92,25 +96,23 @@ flight-parser（M1.2）的 scan 加上 AND subscription_status = active ← 付�
 
 ### Step 1 — Store the ECPay merchant credentials
 
-ECPay has no `products`/`prices` objects to create (unlike Stripe) — the **price is just the `TotalAmount` you put in the checkout form**. So Step 1 is only storing the merchant credentials + your monthly amount. Store the secret (check-then-collect — skip if a previous session already created it). For the whole course you may use the public **stage test merchant**; paste to the agent:
+ECPay has no `products`/`prices` objects to create (unlike Stripe) — the **price is just the `TotalAmount` you put in the checkout form**. So Step 1 is only storing the merchant credentials + your monthly amount. **We implement a fixed monthly price of `NT$300`** — that's the `amount` we store in the secret and read at checkout. (Students can later change `amount` to any integer TWD value they want; everything downstream reads it from the secret, so the price is a one-line change with no code edits.) Store the secret (check-then-collect — skip if a previous session already created it). For the whole course you may use the public **stage test merchant**; paste to the agent:
 
 ask """
 >
-My ECPay monthly amount in TWD (fill this in, integer, e.g. 150): <REPLACE>
->
-Store the ECPay credentials in AWS Secrets Manager as `flight/ecpay`. Use the public **stage** test merchant (safe to commit) unless I gave you a real one. Region us-east-1. Check first, then create if missing:
+Store the ECPay credentials in AWS Secrets Manager as `flight/ecpay`, with the monthly subscription price `amount` set to **`300`** (NT$300 — our implemented price; change this integer later if you want a different fee). Use the public **stage** test merchant (safe to commit) unless I gave you a real one. Region us-east-1. Check first, then create if missing:
 >
 ```bash
 aws secretsmanager describe-secret --secret-id flight/ecpay --region us-east-1 --query "Name"
 ```
 >
-- If that returns `flight/ecpay`, it already exists — skip.
+- If that returns `flight/ecpay`, it already exists — confirm its `amount` is `300` (update if not); otherwise skip.
 >
-- If ResourceNotFoundException → `aws secretsmanager create-secret --name flight/ecpay --secret-string '{"merchant_id":"3002607","hash_key":"pwFHCqoQZGmho4w6","hash_iv":"EkRm7iFT261dpevs","env":"stage","amount":"<the TWD amount above>"}' --region us-east-1`
+- If ResourceNotFoundException → `aws secretsmanager create-secret --name flight/ecpay --secret-string '{"merchant_id":"3002607","hash_key":"pwFHCqoQZGmho4w6","hash_iv":"EkRm7iFT261dpevs","env":"stage","amount":"300"}' --region us-east-1`
 >
 """
 
-**Verify before moving on:** `aws secretsmanager get-secret-value --secret-id flight/ecpay --region us-east-1 --query SecretString --output text` shows `merchant_id`, `hash_key`, `hash_iv`, `env:"stage"`, and your TWD `amount`.
+**Verify before moving on:** `aws secretsmanager get-secret-value --secret-id flight/ecpay --region us-east-1 --query SecretString --output text` shows `merchant_id`, `hash_key`, `hash_iv`, `env:"stage"`, and `amount:"300"`.
 
 ### Step 2 — save_subscription: add the status field + build the recurring-checkout form
 
@@ -119,12 +121,14 @@ Update `aws/save_subscription/handler.py` (it had **no** status in M1). It needs
 1. On `PutItem`, **now write `subscription_status = "pending_payment"`** (the field is born here) plus a freshly generated unique **`MerchantTradeNo`** (≤20 chars; store it on the row — you need it later to cancel).
 2. Build the ECPay AIO **定期定額** params and sign them:
    - `MerchantID` (from `flight/ecpay`), `MerchantTradeNo`, `MerchantTradeDate` (`yyyy/MM/dd HH:mm:ss`), `PaymentType=aio`, `ChoosePayment=Credit`, `EncryptType=1`
-   - `TotalAmount=<amount>` **and** `PeriodAmount=<amount>` — **they must be equal** (ECPay rule)
+   - `TotalAmount=<amount>` **and** `PeriodAmount=<amount>` — **they must be equal** (ECPay rule). `amount` is read from the `flight/ecpay` secret — **`300` in our implementation (NT$300/month)**; never hard-code the number in the handler, always read it from the secret so changing the price stays a one-line secret update.
    - `PeriodType=M`, `Frequency=1`, `ExecTimes=999` (monthly; 999 ≈ "indefinite" — ECPay has no true ∞, see watch-out 6). **Hard-code `M`.** ⏩ *To test the renewal callback (Step 3) without waiting a month, temporarily change this one line to `PeriodType=D, Frequency=1, ExecTimes=2` and redeploy — ECPay then runs the 2nd charge the **next day** and POSTs a real (non-`SimulatePaid`) result to `PeriodReturnURL`. Revert to `M` after.* (`ExecTimes` must be ≥ 2 — ECPay rejects 1.)
    - `ItemName`, `TradeDesc` (avoid WAF keywords like `curl`/`python` — see [[ecpay-best-practice]])
    - `ReturnURL=<api>/ecpay-return`, `PeriodReturnURL=<api>/ecpay-period`, **`OrderResultURL=<api>/ecpay-result`** — ⚠️ **point `OrderResultURL` at a redirect Lambda, NOT the static SPA page.** ECPay delivers it as a **browser POST**; a static host returns **405** on a POST to a page route, so the user sees "This page isn't working" right after paying (the payment still succeeds via `ReturnURL`). See [[ecpay-best-practice]] Rule 11 + Step 3's `flight-ecpay-result`.
    - `CustomField1=email`, `CustomField2=route` — the join key the callbacks read to find the row
    - compute `CheckMacValue` over all of the above
+
+   > **Route examples — match the live `PLANS` map, not just Tokyo/Seoul.** The examples below use `TPE-TYO` (`tokyo`) for brevity, but a real build's `PLANS` had **three** routes — `tokyo` (`TPE-TYO`), `seoul` (`TPE-SEL`), **and `london` (`TPE-LON`)**. M2 adds no payment logic per-route, so any plan in `PLANS` works identically; just don't assume only two exist when reading/seeding rows, and keep `target_price` per the route's real fare band (don't hard-code `400` for a long-haul route — that's only a placeholder).
 3. Return an **auto-submit HTML form** (`<form action="https://payment-stage.ecpay.com.tw/Cashier/AioCheckOut/V5" method="post">` with one hidden input per field + a trailing **`<script>document.forms[0].submit()</script>`** — use the inline script, not just `onload`, so it fires reliably after the front-end does `document.write`). The browser POSTs it to ECPay. (Unlike Stripe you return *HTML*, not a JSON `checkout_url`.)
 4. **Idempotency:** if the row already exists and is `active`, do NOT knock it back to `pending_payment` (preserve a paid user's status). Redeploy.
 
@@ -237,6 +241,8 @@ curl -s -X POST "<api>/cancel" -H "content-type: application/json" \
 
 ### Step 7 — Status-aware UI + the M1→M2 migration
 
+> **Front-end deploy path (Cowork) — don't ask, just do this.** The front-end ships by **cloning the GitHub repo and pushing to `main`** — Vercel auto-deploys from `main`. **GitHub is the source of truth; the connected project folder may be a stale M0 copy — never edit the local copy.** Pull the PAT from Secrets Manager (it may be under `flight/github` *or* `github/personal-access-token` — see [[aws-best-practice]] Rule 2), `git clone https://<PAT>@github.com/<owner>/<repo>` **into a native dir** (not the FUSE-mounted folder — git locking fails there, [[aws-best-practice]] constraint #5), edit `Dashboard.tsx` there, commit, and `git push origin main`. Do **not** stop to ask the student which deploy approach to use — this is it.
+
 `flight-list-subscriptions` (from M1.1) already returns the full row including `subscription_status` — but the M1 front-end **ignored it and treated any row as 已訂閱**, so an unpaid `pending_payment` row wrongly showed as subscribed. Make the cards **status-aware**:
 
 | `subscription_status` | Card shows |
@@ -267,7 +273,7 @@ curl -s -X POST "<api>/cancel" -H "content-type: application/json" \
 11. **Idempotency on `MerchantTradeNo`, not `gwsr`** — `Gwsr` is **empty** on the real recurring first-period callback. Key on the trade-no + "already active?" (See [[ecpay-best-practice]] Rule 4.)
 12. **Front-end must branch on `Content-Type`** — `/subscribe` returns `text/html` (→ `document.write` to ECPay) or `application/json` (→ in-place update). `res.json()` on the HTML silently breaks the button. (Step 2.)
 13. **No SDK, no layer** — CMV is `hashlib.sha256` (use the official `ecpayUrlEncode` — `~`→`%7E` — and validate against `ecpay/test-vectors/`); the cancel POST is `urllib`. Lambdas stay stdlib + boto3, single-file `index.handler`. (See [[aws-best-practice]] + [[ecpay-best-practice]] Rule 2.)
-14. **TWD is a whole-number currency in ECPay** — `TotalAmount=150` means NT$150. (No ×100 cents trap.) But ECPay silently hides credit-card payment below the card minimum (~NT$6–11) — don't test with NT$1.
+14. **TWD is a whole-number currency in ECPay** — our `TotalAmount=300` means exactly NT$300/month (no ×100 cents trap). The value lives in the `flight/ecpay` secret's `amount`, so changing the price is a one-line secret update, not a code change. But ECPay silently hides credit-card payment below the card minimum (~NT$6–11) — don't drop it that low / don't test with NT$1.
 15. **Resend sandbox only reaches your own account email** — test M2's welcome/cancel emails **to yourself**; other recipients 403 until you verify a domain (M3). (See [[resend-best-practice]].)
 16. **Stage vs prod** — M2 runs entirely on the **stage** merchant + cashier URL (`payment-stage.ecpay.com.tw`). Applying for a real MerchantID + confirming 定期定額 is enabled + switching to `payment.ecpay.com.tw` is **M3** ([[ecpay-go-live]]).
 

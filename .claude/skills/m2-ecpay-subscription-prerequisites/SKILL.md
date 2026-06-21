@@ -9,6 +9,10 @@ description: Prerequisites before M2 of the Flight Price Notifier course — an 
 
 M2 adds one account: **ECPay 綠界**. Unlike Stripe there's **no CLI to install and no live/test "mode" toggle** — you just need merchant credentials (MerchantID / HashKey / HashIV) in the `flight/ecpay` secret. For the whole course you can use ECPay's **public stage test merchant**; applying for a real one is M3 ([[ecpay-go-live]]). This skill stores the secret + confirms the M1.3 notifier carryover.
 
+## Architecture
+
+![Flight Fare / Notification architecture (M2) — the payment layer these prerequisites set up the ECPay merchant credentials for. The Product Site [Vercel] POSTs to the ECPay Lambda Handlers (flight-ecpay-return / flight-ecpay-period / flight-cancel-subscription), which talk to ECPay and write subscription_status onto Subscriptions [DynamoDB]; a "subscription check" gate on that table is what makes the Parser scan only active rows. On payment events the handlers enqueue to the Notification-side SQS, where the Subscription Status Notification Lambda emails welcome/cancel via Resend. The M1 flow remains: EventBridge → Parser Wrapper → Parser (×N) reads Flight Routes [S3] + the travelpayouts API, scans Subscriptions, enqueues matches to the Flight Fare Notification SQS → Flight Fare Notification Lambda dedups against Notification History [DynamoDB] and emails via Resend. Inset: the subscribe → ECPay → callback (W = write) loop that flips subscription_status. Legend: orange = manual input, teal = main component, pink = user data.](assets/flight_notification_structure2.jpg)
+
 ## When to load this skill
 
 - "M2 環境準備" / any time M2 detects ECPay (`flight/ecpay`) is missing.
@@ -53,10 +57,10 @@ This shared backoffice is what lets you press **模擬付款** and open **信用
 ```bash
 aws secretsmanager describe-secret --secret-id flight/ecpay --region us-east-1 --query "Name" 2>/dev/null \
   || aws secretsmanager create-secret --name flight/ecpay \
-       --secret-string '{"merchant_id":"3002607","hash_key":"pwFHCqoQZGmho4w6","hash_iv":"EkRm7iFT261dpevs","env":"stage","amount":"150"}' \
+       --secret-string '{"merchant_id":"3002607","hash_key":"pwFHCqoQZGmho4w6","hash_iv":"EkRm7iFT261dpevs","env":"stage","amount":"300"}' \
        --region us-east-1
 ```
-Set `amount` to your intended TWD monthly price (integer; e.g. `150` = NT$150). Keep it a realistic amount — ECPay hides credit-card payment below the card minimum (~NT$6–11), so don't use NT$1.
+`amount` is our **implemented monthly price: `300` (NT$300)**. Students can later set it to any integer TWD value they want — everything downstream reads it from this secret, so the price is a one-line change with no code edits. Keep it realistic — ECPay hides credit-card payment below the card minimum (~NT$6–11), so don't use NT$1.
 
 **Verify:**
 ```bash

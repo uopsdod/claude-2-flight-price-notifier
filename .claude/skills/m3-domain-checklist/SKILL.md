@@ -29,9 +29,11 @@ Ask the student for: their custom domain (or subdomain), the API id, and a **non
   curl -sSI https://yourdomain.com | head -1          # HTTP/2 200
   ```
   (If you bound a subdomain like `fly.yourdomain.com`, check that exact host. A bad/missing cert makes `curl` error out — so a clean `200` also confirms TLS. DNS can take minutes to propagate; a first-try failure may just be propagation — wait and retry.)
+  > **Cowork: the sandbox `curl` is proxy-blocked** (outbound HTTPS to arbitrary hosts returns a 403/000 — [[resend-best-practice]] Rule 0 / [[aws-best-practice]] constraint #2). Don't conclude the site is down from a sandbox `curl`. Verify the `200` with a **URL-fetch tool** instead — e.g. the **Vercel URL-fetch MCP** (`web_fetch_vercel_url` / `get_access_to_vercel_url`) — which fetches the live host from outside the sandbox. The `curl` line is for CLI mode.
+  > **Don't trust Vercel `get_project`'s `domains` array for the attach check — it lags.** The project's domains list can still show the host as pending/absent for a while after it's actually live (and conversely keep a stale entry). **Confirm the domain is attached by *fetching the host* and getting a `200`** (above), not by reading the array. The fetch is ground truth; the API field is eventually-consistent.
 
 ### Section B — Email sender on your domain
-- **B1** Resend shows the sending domain (or sending subdomain) **Verified** (SPF + DKIM).
+- **B1** Resend shows the sending domain (or sending subdomain) **Verified** (SPF + DKIM). *(If it still says "not verified" with the DNS records in place, the student likely hasn't pressed Resend's **Verify Domain** button — it isn't automatic; tell them to click it in Resend → Domains. See [[m3-domain]] Step 3.)*
 - **B2** Secret `from` is your domain:
   ```bash
   aws secretsmanager get-secret-value --secret-id flight/resend --region us-east-1 \
@@ -45,12 +47,13 @@ Ask the student for: their custom domain (or subdomain), the API id, and a **non
      aws lambda update-function-configuration --function-name flight-fare-notification \
        --environment "Variables={CACHE_BUST=$(date +%s)}" --region us-east-1
      ```
-  2. **Invoke with the REAL event shape** — `flight-fare-notification` reads an SQS-style body and needs `cheapest` (missing it → `KeyError`). The AWS MCP `lambda invoke` is **raw-input** (do **not** base64 the payload; and **don't** add `--query`/`--log-type` — the MCP errors on the streaming `Payload` even though the function still runs):
+  2. **Invoke with the REAL event shape** — `flight-fare-notification` reads an SQS-style body and needs **`target_price`** *and* `cheapest` (missing either → `KeyError: 'target_price'` / `'cheapest'`). Pick a `route` the test recipient is **NOT** subscribed to (see note below). The AWS MCP `lambda invoke` is **raw-input** (do **not** base64 the payload; and **don't** add `--query`/`--log-type` — the MCP errors on the streaming `Payload` even though the function still runs):
      ```bash
      aws lambda invoke --function-name flight-fare-notification --region us-east-1 \
-       --payload '{"Records":[{"body":"{\"email\":\"<non-owner>@example.com\",\"route\":\"TPE-TYO\",\"cheapest\":{\"price\":9531,\"depart_date\":\"2026-07-15\"},\"cheapest_usd\":{\"price\":295}}"}]}' \
+       --payload '{"Records":[{"body":"{\"email\":\"<non-owner>@example.com\",\"route\":\"TPE-TYO\",\"target_price\":10000,\"cheapest\":{\"price\":9531,\"depart_date\":\"2026-07-15\"},\"cheapest_usd\":{\"price\":295}}"}]}' \
        /tmp/out.json
      ```
+     > **Use a route the recipient is NOT subscribed to.** This synthetic send writes a `notification_history` dedup row for `<email>#<route>`. If that pair matches a *real* subscription, the row **suppresses the recipient's genuine alert for 24h**. Picking an unsubscribed route (or a throwaway non-owner email) avoids collateral, and you still delete the row in step 4 either way.
   3. **Verify by reading CloudWatch logs** (not the invoke output — the MCP can't read that file). Look for `RESEND_OK 200 → <non-owner>`:
      ```bash
      aws logs filter-log-events --log-group-name /aws/lambda/flight-fare-notification \
