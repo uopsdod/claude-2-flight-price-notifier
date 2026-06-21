@@ -127,6 +127,8 @@ Update `aws/save_subscription/handler.py` (it had **no** status in M1). It needs
    - `ReturnURL=<api>/ecpay-return`, `PeriodReturnURL=<api>/ecpay-period`, **`OrderResultURL=<api>/ecpay-result`** — ⚠️ **point `OrderResultURL` at a redirect Lambda, NOT the static SPA page.** ECPay delivers it as a **browser POST**; a static host returns **405** on a POST to a page route, so the user sees "This page isn't working" right after paying (the payment still succeeds via `ReturnURL`). See [[ecpay-best-practice]] Rule 11 + Step 3's `flight-ecpay-result`.
    - `CustomField1=email`, `CustomField2=route` — the join key the callbacks read to find the row
    - compute `CheckMacValue` over all of the above
+
+   > **Route examples — match the live `PLANS` map, not just Tokyo/Seoul.** The examples below use `TPE-TYO` (`tokyo`) for brevity, but a real build's `PLANS` had **three** routes — `tokyo` (`TPE-TYO`), `seoul` (`TPE-SEL`), **and `london` (`TPE-LON`)**. M2 adds no payment logic per-route, so any plan in `PLANS` works identically; just don't assume only two exist when reading/seeding rows, and keep `target_price` per the route's real fare band (don't hard-code `400` for a long-haul route — that's only a placeholder).
 3. Return an **auto-submit HTML form** (`<form action="https://payment-stage.ecpay.com.tw/Cashier/AioCheckOut/V5" method="post">` with one hidden input per field + a trailing **`<script>document.forms[0].submit()</script>`** — use the inline script, not just `onload`, so it fires reliably after the front-end does `document.write`). The browser POSTs it to ECPay. (Unlike Stripe you return *HTML*, not a JSON `checkout_url`.)
 4. **Idempotency:** if the row already exists and is `active`, do NOT knock it back to `pending_payment` (preserve a paid user's status). Redeploy.
 
@@ -238,6 +240,8 @@ curl -s -X POST "<api>/cancel" -H "content-type: application/json" \
 **Verify:** the row flips to **`cancelled`** with `current_period_end` preserved; the parser **still enqueues it** (grace) until that date passes, then lazily flips it to `expired` (Step 4). In the ECPay 廠商後台 → 信用卡定期定額訂單查詢, the order shows terminated (no more renewals). See the lifecycle diagram in [[ecpay-best-practice]] Rule 9.
 
 ### Step 7 — Status-aware UI + the M1→M2 migration
+
+> **Front-end deploy path (Cowork) — don't ask, just do this.** The front-end ships by **cloning the GitHub repo and pushing to `main`** — Vercel auto-deploys from `main`. **GitHub is the source of truth; the connected project folder may be a stale M0 copy — never edit the local copy.** Pull the PAT from Secrets Manager (it may be under `flight/github` *or* `github/personal-access-token` — see [[aws-best-practice]] Rule 2), `git clone https://<PAT>@github.com/<owner>/<repo>` **into a native dir** (not the FUSE-mounted folder — git locking fails there, [[aws-best-practice]] constraint #5), edit `Dashboard.tsx` there, commit, and `git push origin main`. Do **not** stop to ask the student which deploy approach to use — this is it.
 
 `flight-list-subscriptions` (from M1.1) already returns the full row including `subscription_status` — but the M1 front-end **ignored it and treated any row as 已訂閱**, so an unpaid `pending_payment` row wrongly showed as subscribed. Make the cards **status-aware**:
 

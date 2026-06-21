@@ -44,6 +44,9 @@ Subscription rows are the authoritative source — read them with `aws dynamodb 
     ```
 
 ### Section B — Callbacks verify CMV + flip to active
+
+> **No card handy? Verify the callback path with a validly-signed synthetic callback (same-day).** The real cashier needs a human (card + OTP), but B2/B3 (and E1/D3 grace) can be proven **without a card** by POSTing a callback you sign yourself with the real `flight/ecpay` secret — `RtnCode=1`, `CustomField1=<email>`, `CustomField2=<route>`, **including the empty `CustomField3=&CustomField4=`**, `CheckMacValue` via `gen_cmv` (no `SimulatePaid`) — to the deployed `…/ecpay-return`, then assert the row flips to `active`. This catches CMV / empty-field / idempotency bugs early. It's a **backend** proof only (no cashier UI / `OrderResultURL`), so still do **one** real stage test-card run before signing off, and record the two separately (see [[ecpay-best-practice]] Rule 8). *(Cowork can't POST from the sandbox — run the signed POST from a throwaway Lambda or the CLI.)*
+
 - **B1** Both callback Lambdas exist — two separate calls (Cowork MCP runs one API call at a time, no shell loop): `aws lambda get-function --function-name flight-ecpay-return --region us-east-1 --query 'Configuration.FunctionName'` and `aws lambda get-function --function-name flight-ecpay-period --region us-east-1 --query 'Configuration.FunctionName'`.
 - **B2** CheckMacValue verification works (no rejects). Trigger the first-period callback via the stage 後台「模擬付款」 (or a real test-card run) and read the logs — use `filter-log-events` (Cowork MCP has no `logs tail`):
   ```bash
@@ -142,5 +145,6 @@ Subscription rows are the authoritative source — read them with `aws dynamodb 
   - 模擬付款 grants free access → guard `SimulatePaid` (Rule 7).
   - cancel does nothing → cancel is `CreditCardPeriodAction Action=Cancel` that **you** call, not an event you wait for (Rule 9). `90100150` on a never-paid order is expected.
   - emails not arriving → Resend sandbox only reaches your own account email (verify a domain at M3).
+  - **welcome/cancel email never arrives, log shows `403` with body `error code: 1010`** → the new `flight-status-notification` Lambda is POSTing to Resend **without a `User-Agent` header**, so Cloudflare (in front of `api.resend.com`) bans it. This is **not** an account/recipient issue — add a `User-Agent` to the POST and reuse M1's `_send`/headers ([[resend-best-practice]] Rule 4). Distinguish from the sandbox `validation_error` 403 by the `1010` code.
   
   then re-run `驗收 M2`.

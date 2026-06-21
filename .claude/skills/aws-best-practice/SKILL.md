@@ -49,6 +49,9 @@ So you **cannot** get a built zip to S3 by any direct path: the sandbox has the 
    - `aws lambda invoke` → **rejects `--query` and `--cli-binary-format`.** And **`--payload` is forwarded RAW, not base64** — send plain JSON (`'{"k":"v"}'`); base64-encoding it fails with `InvalidRequestContentException`.
    - **JMESPath backtick literals fail to parse** anywhere (`SecretList[?starts_with(Name,\`flight/\`)]` → "Unknown token"). Use plain projections: `--query "SecretList[].Name"`.
    - **`s3api put-object` Body can't be inlined.** `--cli-input-json '{"Body":"…"}'` is a streaming blob the CLI **silently drops → a 0-byte object**, and there's **no `--body <file>`** to point at without a shell. This is *why* the `flight-seed` bridge exists, not a clever one-liner.
+   - **`dynamodb query --scan-index-forward false` is rejected.** Use the boolean flag form **`--no-scan-index-forward`** (and `--scan-index-forward` for ascending) — the `<flag> <value>` form fails validation.
+   - **`&&` (and other shell chaining) is rejected** as "prohibited operators." The MCP runs one AWS call, not a shell line — send each command separately (independent calls can go as parallel tool uses).
+   - **The batch/array form of `call_aws`** (`["aws …","aws …"]`) **fails validation** — pass a single command string per call; issue multiple calls instead of one array.
 5. **Git on the mounted folder fails.** `git clone`/ops in the mounted workspace folder error (`config.lock: Operation not permitted` — FUSE can't do git's locking). **Clone into a native dir** (the agent's home); treat the working copy as **ephemeral** — GitHub + Vercel are the source of truth.
 
 **→ Deployed shape ≠ repo layout (state this up front).** Every function in this stack deploys as a **single-file `index.handler`** — *not* the `aws/<fn>/handler.py` + a `common/` package the repo sources suggest, and *not* `zip … --zip-file fileb://`. In Cowork the sandbox has **no network route to AWS**, so code goes in **inside the API call** (inline CFN, Method 1) or **via the base64→S3 bridge** (Method 2). Fold shared helpers (CMV, ddb access) **into each `index.py`** rather than importing a package. (The repo's `aws/` tree can lag the deployed code — the verified M2 sources live single-file; treat the deployed function as the source of truth for behavior.)
@@ -111,6 +114,29 @@ So you **cannot** get a built zip to S3 by any direct path: the sandbox has the 
 
 This is the standard way to land bytes in S3 from an `aws`-only connector — for **>4096-char function zips** (e.g. M1.3's `flight-fare-notification`, whose folded HTML/text renderer is ~5–6 KB *and* mixes single+double quotes, so inline CFN is doubly impossible). Note most functions **fold into a single `index.py`** (boto3/stdlib only, **no layer** anywhere in this course — see Rule 6); the reason to use S3 is the **size cap** + the ETag-verifiable artifact, not file count.
 
+**→ Reading deployed Lambda source in Cowork: the `flight-srcdump` helper.** "The deployed function is the source of truth" (above) is only useful if you can *read* it — and in Cowork you can't: the sandbox has no AWS network (a presigned `get-function` code URL is blackholed → HTTP 000), and `aws lambda invoke`'s output file is unreadable (constraint #3). So when you need to faithfully **extend** an existing function (e.g. M2 layering `subscription_status` onto M1's `save_subscription`, or the `active`-gate onto the `parser`), deploy a third standing helper alongside `flight-seed`/`flight-assemble`:
+
+```python
+# flight-srcdump — downloads a target function's own deployment zip, extracts the .py,
+# and writes the source to SSM /flight/srcdump/<fn> so you can read it inline.
+import boto3, urllib.request, io, zipfile, json
+def handler(e, c):
+    lam, ssm = boto3.client("lambda"), boto3.client("ssm")
+    url = lam.get_function(FunctionName=e["fn"])["Code"]["Location"]   # presigned; runs INSIDE AWS, so reachable
+    z = zipfile.ZipFile(io.BytesIO(urllib.request.urlopen(url).read()))
+    src = "\n\n# ===== %s =====\n" % e["fn"] + "\n".join(
+        "### FILE: %s\n%s" % (n, z.read(n).decode("utf-8", "replace"))
+        for n in z.namelist() if n.endswith(".py"))
+    ssm.put_parameter(Name="/flight/srcdump/%s" % e["fn"], Value=src[:4096],
+                      Type="String", Overwrite=True)              # 4 KB Standard cap; use Advanced/parts if bigger
+    return {"ok": True, "files": [n for n in z.namelist() if n.endswith(".py")], "bytes": len(src)}
+```
+
+- Its role needs **`lambda:GetFunction`** on the target + **`ssm:PutParameter`** on `/flight/srcdump/*` (add to `flight-lambda-role`).
+- Read it back inline (this the sandbox/MCP *can* do): `aws ssm get-parameter --name /flight/srcdump/flight-save-subscription --query "Parameter.Value" --output text --region us-east-1`.
+- Source over ~4 KB: write `Type=Advanced` (8 KB) or have `flight-srcdump` split into `/flight/srcdump/<fn>/<n>` parts and read them in order (same chunking idea as `flight-assemble`).
+- **Inspect before you modify.** The repo's `aws/` tree can lag the live code (constraint **Deployed shape ≠ repo layout**); dump the deployed source first, edit *that*, then redeploy via Method 2 — don't extend the stale repo copy.
+
 ---
 
 ## Hard rules
@@ -138,7 +164,9 @@ This is the standard way to land bytes in S3 from an `aws`-only connector — fo
 | `flight/ecpay` | `{"merchant_id":"…","hash_key":"…","hash_iv":"…","env":"stage|prod","amount":"…"}` | M2 | **Lambda runtime** (checkout + callbacks + cancel) |
 | `flight/telegram` | `{"bot_token":"…"}` | M4 | **Lambda runtime** (chat) |
 | `flight/anthropic` | `{"api_key":"sk-ant-…"}` | M4 | **Lambda runtime** (chat) |
-| `flight/github` | `{"pat":"github_pat_…"}` | M1.1 prereq | **session bootstrap** — the Cowork git tool, to push |
+| `flight/github` | `{"pat":"github_pat_…"}` or bare string | M0 (Step 6) | **session bootstrap** — the Cowork git tool, to push (M1.1 prereq just discovers it) |
+
+> **PAT secret name can differ** — the table's `flight/github` is the convention, but a real build had the GitHub PAT under **`github/personal-access-token`** instead. Before assuming it's missing, list the secrets and check both names: `aws secretsmanager list-secrets --query "SecretList[].Name" --region us-east-1` → grep for `github`. Use whichever exists; don't re-collect a PAT that's already stored under the other name.
 | `flight/supabase` | `{"url":"…","publishable_key":"…"}` | M0 | **session recall** — the front-end build env (publishable key is **public by design**) |
 
 **Two kinds of secret, treated the same way for storage but not for sensitivity:**

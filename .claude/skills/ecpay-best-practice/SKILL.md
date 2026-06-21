@@ -178,6 +178,11 @@ Use 模擬付款 freely in stage to confirm reachability; rely on a **real stage
 - Watch `aws logs tail /aws/lambda/flight-ecpay-return --since 5m --region us-east-1` for CMV-verified + `UpdateItem`.
 - If 模擬付款 in the backoffice errors, the usual causes are: ReturnURL not public, a firewall blocking ECPay's source IP, or the handler replying something other than `1|OK`.
 
+> **No-card backend verification — POST a validly-signed synthetic callback.** The real cashier payment needs a human (card + OTP), but the whole **callback → activation** path can be proven **without a card** by replaying a callback you sign yourself with the real `flight/ecpay` secret. This is how to verify B2/B3/cancel/grace **same-day** (mark the real-card run separately) — and it catches CMV / empty-field / idempotency bugs early. Build the form body exactly as ECPay would (`MerchantID`, `MerchantTradeNo` = a row's stored trade-no, `RtnCode=1`, `CustomField1=<email>`, `CustomField2=<route>`, **including the empty `CustomField3=&CustomField4=`**), compute `CheckMacValue` over it with `gen_cmv` (Rule 2), and POST it `application/x-www-form-urlencoded` to your deployed `…/ecpay-return`. Assert the row flips to `active`.
+> - **Crucially keep the empty CustomFields in the signed body** — that's the exact shape Rule 2 protects; a synthetic callback that drops them won't catch the #1 bug (it tests the wrong string).
+> - Do **not** set `SimulatePaid=1` (that path is correctly *not* activated, Rule 7) — a synthetic *real* callback is `RtnCode=1` without it.
+> - This is a **backend** proof; it does not exercise the cashier UI or `OrderResultURL` (Rule 11). Still do one real stage test-card run before calling M2 done — note the synthetic check and the real-card check separately in the checklist.
+
 ---
 
 ### Rule 9 — Cancel is an API call you make (`CreditCardPeriodAction`), not an event you receive — and it grants a GRACE PERIOD, not instant expiry
@@ -189,6 +194,7 @@ Use 模擬付款 freely in stage to confirm reachability; rely on a **real stage
 **How to apply (the cancellation-grace lifecycle — the single biggest thing the naive design gets wrong):**
 - Store `merchant_trade_no` on the `subscriptions` row at subscribe time (you need it to cancel).
 - **Track `current_period_end`** (a sortable ISO timestamp; keep a human `current_period_end_date` too): **set it on the first charge** (`flight-ecpay-return`) and **refresh it on every renewal** (`flight-ecpay-period`) — each successful charge extends the paid-through date by one period.
+  > **⚠️ The grace check (`current_period_end >= now`) is a *lexicographic string compare*, not a datetime compare** — DynamoDB stores the string and the parser compares strings. So **every** writer (`flight-ecpay-return`, `flight-ecpay-period`, the cancel fallback) and the parser **must use the identical fixed-width UTC format** — standardize on **`%Y-%m-%dT%H:%M:%SZ`** (e.g. `2026-07-21T03:00:00Z`). A `+00:00` offset vs a `Z` suffix, or a non-zero-padded field, sorts wrong as a string and **silently breaks the grace math** (a paying user cut off early, or a lapsed one alerted forever) even though the instants are equal. Compute `now` the same way (`datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")`).
 - `/cancel` Lambda: call ECPay `Action=Cancel`, then `UpdateItem` status → **`cancelled`** (keep `current_period_end`), enqueue the cancel email. Do **not** set `expired` here.
 - **The parser gate must serve `active` AND `cancelled`-within-period rows**, and **lazily flip `cancelled` → `expired`** once `current_period_end` has passed (the parser is the natural place to do this since it scans the rows anyway — see Rule 12).
 - **A `cancelled`-in-grace subscriber can still update their target price** in place — no re-payment, status stays `cancelled`. (Their existing watch is still live until the period ends.)
