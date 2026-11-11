@@ -1,0 +1,19 @@
+# Installed at /etc/systemd/system/openclaw-gateway.service
+# A system unit (not a systemd --user unit) so it starts on boot with no login and is easy to drive from SSM.
+[Unit]
+Description=OpenClaw Gateway (Flight Price Notifier Telegram customer service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+Environment=HOME=/home/ubuntu
+WorkingDirectory=/home/ubuntu
+# "+" runs this one step as root so it can call Secrets Manager with the instance role.
+ExecStartPre=+/usr/local/bin/flight-openclaw-secrets
+ExecStart=/usr/bin/openclaw gateway run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
