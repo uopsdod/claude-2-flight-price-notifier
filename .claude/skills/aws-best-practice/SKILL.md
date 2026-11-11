@@ -173,7 +173,7 @@ result
 3. `lambda Invoke` `flight-seed` with `Payload = json.dumps({"bucket": …, "key": "lambda/x.zip", "b64": "<BASE64>", "ct": "application/zip"})`.
 4. **HARD RULE: `s3 HeadObject` and require ETag == the local md5 before `CreateFunction`/`UpdateFunctionCode` with `Code.S3Bucket/S3Key`.** The base64 text is copied by the model from the bash output into the script, and long copies have corrupted silently before (same-length one-character substitutions that only the ETag check caught). For a zip over ~1.5 KB, split the base64 into ~600-char pieces aligned to 4-char boundaries, seed each to its own key, check each part's ETag, then join them with a `flight-assemble` Lambda (read the parts in order, `put_object` the concatenation) and check the final ETag.
 
-**→ Reading deployed Lambda source in Cowork: the `flight-srcdump` helper.** "The deployed function is the source of truth" (above) is only useful if you can *read* it — and in Cowork you can't: the sandbox has no AWS network (a presigned `get-function` code URL is blackholed → HTTP 000), and `aws lambda invoke`'s output file is unreadable (constraint #3). So when you need to faithfully **extend** an existing function (e.g. M2 layering `subscription_status` onto M1's `save_subscription`, or the `active`-gate onto the `parser`), deploy a third standing helper alongside `flight-seed`/`flight-assemble`:
+**→ Reading deployed Lambda source in Cowork: the `flight-srcdump` helper.** "The deployed function is the source of truth" (above) is only useful if you can *read* it — and in Cowork you can't download it directly: `GetFunction` returns a presigned code URL, but neither the AWS MCP script sandbox nor the bash sandbox can fetch it, and the script sandbox can't unzip. So when you need to faithfully **extend** an existing function (e.g. M2 layering `subscription_status` onto M1's `save_subscription`, or the `active`-gate onto the `parser`), deploy a third standing helper alongside `flight-seed`/`flight-assemble`:
 
 ```python
 # flight-srcdump — downloads a target function's own deployment zip, extracts the .py,
@@ -306,10 +306,9 @@ There's **no `stripe listen` equivalent** — ECPay needs a public URL. Test via
 - `04_deploy_lambdas.sh`: `cp flightproxy/travelpayouts.py aws/parser/` and `cp flightproxy/email_render.py aws/fare_notification/` before zipping each function. The ECPay Lambdas (`save_subscription`, `ecpay_return`, `ecpay_period`, `cancel_subscription`) are stdlib + boto3 — nothing to copy or layer.
 - If you ever add a C-extension dep later, build it with `--platform manylinux2014_x86_64` (or Docker), not on the Mac directly.
 
-**In Cowork** the build-sandbox can't hand a zip to the MCP (see *Cowork execution constraints* above), so:
-- **Every function folds into one `index.py`** (boto3/stdlib only, in the runtime) and deploys with **Method A** (ASCII-safe zip → `Code.ZipFile`) — any size, **no layer**. M1.2's `parser`/`wrapper` inline `fetch_cheapest` + the routes read; M1.3's notification Lambda inlines its HTML/text renderer.
+**In Cowork** (see *Cowork execution constraints* above):
+- **Every function folds into one `index.py`** (boto3/stdlib only, in the runtime) and deploys with **Method A** (ASCII-safe zip → `Code.ZipFile`) — any size, no S3 detour.
 - Inline CFN (Method B) still works for the existing ≤4096-char steps; the `flight-seed` bridge (Method C) is only for genuine binary bytes.
-- **No dependency layer anywhere** (Rule 6) — M2's ECPay Lambdas are stdlib + boto3 (CMV via `hashlib`, cancel via `urllib`), so there's no `flight-deps` zip to seed.
 
 ---
 
