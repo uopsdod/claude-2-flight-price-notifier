@@ -280,10 +280,9 @@ There's **no `stripe listen` equivalent** — ECPay needs a public URL. Test via
 - `04_deploy_lambdas.sh`: `cp flightproxy/travelpayouts.py aws/parser/` and `cp flightproxy/email_render.py aws/fare_notification/` before zipping each function. The ECPay Lambdas (`save_subscription`, `ecpay_return`, `ecpay_period`, `cancel_subscription`) are stdlib + boto3 — nothing to copy or layer.
 - If you ever add a C-extension dep later, build it with `--platform manylinux2014_x86_64` (or Docker), not on the Mac directly.
 
-**In Cowork** the build-sandbox can't hand a zip to the MCP (see *Cowork execution constraints* above), so:
-- **Every function folds into one `index.py`** (boto3/stdlib only, in the runtime) and deploys with **Method A** (ASCII-safe zip → `Code.ZipFile`) — any size, **no layer**. M1.2's `parser`/`wrapper` inline `fetch_cheapest` + the routes read; M1.3's notification Lambda inlines its HTML/text renderer.
+**In Cowork** (see *Cowork execution constraints* above):
+- **Every function folds into one `index.py`** (boto3/stdlib only, in the runtime) and deploys with **Method A** (ASCII-safe zip → `Code.ZipFile`) — any size, no S3 detour.
 - Inline CFN (Method B) still works for the existing ≤4096-char steps; the `flight-seed` bridge (Method C) is only for genuine binary bytes.
-- **No dependency layer anywhere** (Rule 6) — M2's ECPay Lambdas are stdlib + boto3 (CMV via `hashlib`, cancel via `urllib`), so there's no `flight-deps` zip to seed.
 
 ---
 
