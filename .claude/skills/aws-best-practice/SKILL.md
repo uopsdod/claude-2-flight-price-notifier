@@ -5,7 +5,7 @@ description: Hard rules and operational SOP for the AWS side of the Flight Price
 
 # AWS Best Practice (Flight Price Notifier — serverless)
 
-This course's AWS side is **100% serverless** — there is **no EC2, no SSH, no SSM, no systemd**. The pieces are: **6 Lambdas**, **2 DynamoDB tables** (`subscriptions`, `notification_history`), **2 SQS queues**, an **S3** routes config, **API Gateway (HTTP API v2)**, **EventBridge**, and **Secrets Manager**. AWS access is the **`[default]` profile** (IAM user `admin-for-cowork` with `AdministratorAccess`), read by the **AWS API MCP** in Cowork; every command pins **`--region us-east-1`**.
+This course's AWS side is **100% serverless** — there is **no EC2, no SSH, no SSM, no systemd**. The pieces are: **6 Lambdas**, **2 DynamoDB tables** (`subscriptions`, `notification_history`), **2 SQS queues**, an **S3** routes config, **API Gateway (HTTP API v2)**, **EventBridge**, and **Secrets Manager**. AWS access in Cowork is the official **AWS MCP** connector, signed in through the browser (OAuth — no IAM user, no access key; set up in [[m0-landing-and-signin]] Step 5.2); every command pins **`--region us-east-1`** (`region_name="us-east-1"` in AWS MCP scripts).
 
 When guiding a student through AWS operations, **apply these rules proactively** — stop them before they break one. Each rule maps to a real failure mode of *this* stack.
 
@@ -21,13 +21,15 @@ The hard rules apply identically in both — only the command surface differs.
 
 | Operation | CLI mode | Cowork mode |
 |---|---|---|
-| Run any AWS API call | `aws <service> <verb> ... --region us-east-1` | `call_aws <service> <verb> ...` via AWS API MCP (set region/creds in the connector) |
+| Run any AWS API call | `aws <service> <verb> ... --region us-east-1` | AWS MCP `aws___run_script` → `await call_boto3(service_name="<service>", operation_name="<PascalCaseOperation>", region_name="us-east-1", params={...})` |
 | Deploy a 1-file Lambda | `aws lambda create-function --zip-file fileb://fn.zip ...` | inline CFN `Code.ZipFile` (Method 1 below) — no file transfer |
 | Deploy a >4096-char / layered Lambda | `zip` the dir → `--zip-file fileb://fn.zip` | S3 via the `flight-seed` base64 bridge → `Code.S3Bucket/S3Key` (Method 2 below) |
 | Read a Lambda's logs | `aws logs tail /aws/lambda/<fn> --since 10m --follow` | `aws logs filter-log-events --log-group-name /aws/lambda/<fn> --query "events[].message"` (the MCP rejects `logs tail`) |
-| Inspect a DynamoDB row | `aws dynamodb get-item --table-name subscriptions --key '{...}'` | `call_aws dynamodb get-item ...` |
+| Inspect a DynamoDB row | `aws dynamodb get-item --table-name subscriptions --key '{...}'` | `dynamodb` `GetItem` via AWS MCP |
 
-**Profile/region:** the course uses the **`[default]`** AWS profile (no `--profile` flag needed). It has **no default region**, so **every** call passes `--region us-east-1`. In Cowork the AWS API MCP reads `~/.aws/credentials`'s `[default]` block (written via a Claude CLI session — see [[m1-flight-price-checker-prerequisites]]). Forgetting the region is the #1 "it works for me but not in the script" gap.
+**Region:** **every** call passes `us-east-1` (`--region us-east-1` in CLI, `region_name="us-east-1"` in AWS MCP scripts). Forgetting the region is the #1 "it works for me but not in the script" gap. In Cowork, AWS access is the AWS MCP browser sign-in — nothing on disk; CLI mode uses the student's local `aws` login.
+
+> ⚠️ **Not yet re-verified on AWS MCP.** The commands and the *Cowork execution constraints* below were written and verified on the **old AWS API MCP** connector (`call_aws`, an `aws`-CLI-only runner). In Cowork, run each `aws …` line's API operation through `call_boto3` instead. AWS MCP runs Python with boto3, so some workarounds below (e.g. the `flight-seed` base64 bridge for zips) may no longer be necessary — keep using them until they've been re-tested.
 
 ---
 
@@ -35,7 +37,7 @@ The hard rules apply identically in both — only the command surface differs.
 
 In Cowork there are **two separate hosts**, and the gap between them — **not** an auth gap — is what bites:
 
-- **The AWS API MCP** *does* have AWS access: it authenticates from `~/.aws/credentials` (the `[default]` profile written in prereqs) and runs `aws` calls. **Creds and network are fine.** But — verified on a real M1.2 run — the common connector is **`aws`-CLI-only: it executes `aws` API commands and nothing else.** It has **no shell**, so it **cannot author files, run `zip`, or `cat` an output** in any workdir. (Some connector builds *do* expose a writable workdir; **don't assume it** — see the capability fork below.)
+- **The AWS connector** *does* have AWS access (AWS MCP: browser sign-in; old AWS API MCP: `~/.aws/credentials`) and runs AWS API calls. **Creds and network are fine.** But — verified on a real M1.2 run — the common connector is **`aws`-CLI-only: it executes `aws` API commands and nothing else.** It has **no shell**, so it **cannot author files, run `zip`, or `cat` an output** in any workdir. (Some connector builds *do* expose a writable workdir; **don't assume it** — see the capability fork below.)
 - **The bash/build sandbox** is a *different* host. It can build a zip, but has **no AWS creds and no network route to AWS** (DNS to `*.amazonaws.com` is blackholed; s3/sts/lambda return **HTTP 000**), and **no shared path to the connector** — so it can't hand the built zip to the MCP, and can't upload to S3 itself.
 
 So you **cannot** get a built zip to S3 by any direct path: the sandbox has the file but no network; the MCP has the network but can't author the file. The bridge that closes this gap is a tiny **`flight-seed` Lambda** (Method 2 below). Other gotchas from real runs:
@@ -115,11 +117,11 @@ This is the standard way to land bytes in S3 from an `aws`-only connector — fo
 
 ## Hard rules
 
-### Rule 1 — Pin `--region us-east-1` on every command (the `[default]` profile has no region)
+### Rule 1 — Pin `us-east-1` on every call (`--region` in CLI, `region_name` in AWS MCP)
 
-> **The rule:** No bare `aws ...` without a region. Always `--region us-east-1`. All ARNs hardcode `us-east-1` and the account ID. (No `--profile` flag — the course uses `[default]`.)
+> **The rule:** No bare `aws ...` without a region. Always `--region us-east-1` (AWS MCP: `region_name="us-east-1"`). All ARNs hardcode `us-east-1` and the account ID.
 
-**Why:** The `[default]` profile has no region configured, so a call without `--region` either errors (`You must specify a region`) or, worse, silently hits a *different* default region where none of your resources exist — and you get `ResourceNotFoundException` for a table that demonstrably exists (in us-east-1). The same drift bites ARNs: an EventBridge rule ARN or SQS ARN with the wrong region/account silently never matches. Pin both, everywhere.
+**Why:** A call without an explicit region either errors (`You must specify a region`) or, worse, silently hits a *different* default region where none of your resources exist — and you get `ResourceNotFoundException` for a table that demonstrably exists (in us-east-1). The same drift bites ARNs: an EventBridge rule ARN or SQS ARN with the wrong region/account silently never matches. Pin both, everywhere.
 
 **How to apply:** In `scripts/env.sh`: `REGION=us-east-1; ACCOUNT=<your account id>` and reference `--region "$REGION"` in every script (resolve `ACCOUNT` once via `aws sts get-caller-identity --query Account --output text`). When a call returns "not found" for something you just created, **check the region first** before assuming it wasn't created.
 
@@ -236,14 +238,15 @@ There's **no `stripe listen` equivalent** — ECPay needs a public URL. Test via
 
 ---
 
-### Rule 8 — Use a dedicated IAM user/role; never root keys; one shared `flight-lambda-role`
+### Rule 8 — Connect via the AWS MCP sign-in (no access keys); one shared `flight-lambda-role`
 
-> **The rule:** AWS access for the CLI/MCP uses a named IAM user (**`admin-for-cowork`**, `AdministratorAccess`) whose access key is written to the `[default]` profile — **never AWS root keys** (root is only used once, to *create* that IAM user). All Lambdas assume one **`flight-lambda-role`** scoped to exactly this project's resources.
+> **The rule:** Cowork reaches AWS only through the **AWS MCP** connector, signed in through the browser ([[m0-landing-and-signin]] Step 5.2) — **no IAM user + access key, no `~/.aws/credentials`, no `AKIA…` key pasted anywhere.** All Lambdas assume one **`flight-lambda-role`** scoped to exactly this project's resources.
 
-**Why:** Root keys can't be scoped, audited per-key, or cleanly rotated — a leak means rotating everything. A named IAM user is auditable and deletable. For the Lambdas, one shared role is fine at course scale; its inline policy is scoped to the two table ARNs, the two queue ARNs, the `flight/*` secrets, the S3 routes prefix, and `lambda:InvokeFunction` on `flight-parser` — **not** `Resource: "*"`.
+**Why:** An access key is a long-lived credential — once it's in a file, a chat, or a screenshot, anyone who sees it has that access until someone revokes it. The OAuth sign-in leaves no key to leak; you cut access by removing the connector. For the Lambdas, one shared role is fine at course scale; its inline policy is scoped to the two table ARNs, the two queue ARNs, the `flight/*` secrets, the S3 routes prefix, and `lambda:InvokeFunction` on `flight-parser` — **not** `Resource: "*"`.
 
 **How to apply:**
-- If an `AKIA…` key is ever pasted into chat / a commit / a screenshot → delete it immediately and issue a new one; anyone who sees it has full access until revoked.
+- If AWS tools disappear or calls fail with a sign-in / auth error → the session expired; reconnect the AWS MCP connector and sign in again. Don't fall back to an access key.
+- A student who set up the old way (IAM user + access key for the old AWS API MCP) → once AWS MCP works, deactivate and delete that key. If an `AKIA…` key is ever pasted into chat / a commit / a screenshot → delete it immediately.
 - Keep the role's policy in `scripts/iam-policy.json` (version-controlled), so it's reproducible.
 - For a course, scoping to specific resource ARNs (not full admin on the role) is the teaching-grade floor; production would split per-Lambda least-privilege.
 
