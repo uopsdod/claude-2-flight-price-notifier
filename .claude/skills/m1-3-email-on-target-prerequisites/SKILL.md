@@ -124,7 +124,7 @@ aws cloudformation delete-stack --stack-name flight-resend-test --region us-east
 
 ## Step 2 — Confirm M1.2 carryover
 
-Paste this to the Cowork agent (it runs each `aws` call via the AWS API MCP):
+Paste this to the Cowork agent (it runs each `aws` call via the AWS MCP):
 
 ask """
 >

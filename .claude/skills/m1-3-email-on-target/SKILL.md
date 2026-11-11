@@ -89,7 +89,7 @@ If it's missing → go back and run the M1.3 prereq Step 1. (Sending stays from 
 
 ### Step 2 — Write the fare-notification Lambda (consumer + dedup)
 
-This is a **single self-contained `index.py`** (handler `index.handler`) — you write the renderer functions inline (Step 2 box below). It's **too big for inline CFN** (the folded HTML/text renderer is ~5–6 KB, over the 4096-char cap — and the handler mixes single + double quotes, which breaks shell-escaping a CFN template body), so it deploys via the **S3 `flight-seed` bridge** (Method 2), like the M1.2 parser. Triggered per SQS message, it:
+This is a **single self-contained `index.py`** (handler `index.handler`) — you write the renderer functions inline (Step 2 box below). It's **too big for inline CFN** (the folded HTML/text renderer is ~5–6 KB, over the 4096-char cap — and the handler mixes single + double quotes, which breaks shell-escaping a CFN template body), so it deploys with **Method A** in [[aws-best-practice]] (an ASCII-safe zip straight into `Code.ZipFile`), like the M1.2 parser. Its Chinese email text is auto-escaped to `\uXXXX` by `ascii_zip()` — keep it in normal string literals (not `r"…"`). Triggered per SQS message, it:
 1. Read `flight/resend` from Secrets Manager (for the API key + `from`).
 2. For the message's `{email, route}`, **`Query notification_history`** on `pk = f"{email}#{route}"`, newest first, limit 1.
    - **Key schema (matters for the query):** `notification_history` is **`pk` (HASH, type S)** + **`sent_at` (RANGE/sort key, type S — ISO-8601 UTC string, e.g. `2026-06-07T12:00:00Z`)**. Because `sent_at` is a **sortable String** sort key, `Query … ScanIndexForward=False, Limit=1` returns the **latest** alert for that pk. **Don't** store `sent_at` as an epoch **Number** — that changes the range-key type and breaks the table / the "newest first" ordering.
@@ -139,7 +139,7 @@ aws lambda update-function-configuration --function-name flight-fare-notificatio
 ```
 *(Optional but recommended even without a full DLQ: a redrive policy with a small `maxReceiveCount` so a permanent-failure message can't retry forever — see the failure-class handling in Step 2.5.)*
 
-**Verify before moving on:** with a seeded match on the queue (re-run the M1.2 parser if needed), the consumer sends one email (read its logs with `filter-log-events` — the MCP rejects `logs tail`):
+**Verify before moving on:** with a seeded match on the queue (re-run the M1.2 parser if needed), the consumer sends one email (read its logs with `logs FilterLogEvents` in AWS MCP):
 ```bash
 aws logs filter-log-events --log-group-name /aws/lambda/flight-fare-notification \
   --query "events[].message" --region us-east-1
@@ -191,7 +191,7 @@ Skip all of this and the milestone is still complete; the booking link just earn
 8. **Empty fares never reach here** — the parser skips empty Travelpayouts results, so a message on the queue always carries a real fare.
 9. **TWD is the headline, USD is supplementary** — read **`cheapest`** (TWD) for the gate/dedup/headline; render the 約 US$ line only when the message has **`cheapest_usd`** (it's optional — the parser omits it if the USD fetch failed). The subject is NT$.
 10. **Drop permanent failures, retry only transient** — `403`/`422` (incl. demo-sender to a non-account address) → log + delete; `429`/`5xx` → let SQS redeliver. With no DLQ, raising on a permanent error loops forever and triggers a `429` cascade.
-11. **This Lambda deploys via the S3 bridge, not inline** — the folded renderer is >4096 chars and mixes quote types; use Method 2 (see [[aws-best-practice]]).
+11. **This Lambda deploys with Method A, not inline** — the folded renderer is >4096 chars and mixes quote types; use the ASCII-safe zip (see [[aws-best-practice]] Method A).
 12. **Cloudflare blocks the default urllib UA** — POST to `api.resend.com` with a custom `User-Agent` or you get `403` `error code: 1010` (looks like a bad key — it isn't). See [[resend-best-practice]] Rule 4.
 13. **`notification_history` `sent_at` is an ISO-8601 String sort key** — not an epoch Number, or the range-key type / "newest first" query breaks.
 
@@ -208,5 +208,5 @@ When `m1-3-email-on-target-checklist` is green: 「M1.3 完成！達標會真的
 - Resend API: https://resend.com/docs/api-reference/emails/send-email
 - Renderer: **write** `subject`/`render_html`/`render_text`/`booking_url` inline (Step 2) — `flightproxy/email_render.py` in the repo is the reference spec (NT$ headline + optional 約 US$; marker optional).
 - Dedup pattern modeled on the sibling bag-notification service's history-table + window approach.
-- [[aws-best-practice]] — Cowork S3 deploy (Method 2), SQS visibility timeout, Decimal, the event-source-mapping IAM actions.
+- [[aws-best-practice]] — Cowork deploy (Method A: ASCII-safe zip), SQS visibility timeout, Decimal, the event-source-mapping IAM actions.
 - [[resend-best-practice]] — the demo-sender-only-to-self trap, verified-`from` deliverability, dedup-before-send, html+text, no-VPC, rate limits.

@@ -52,7 +52,7 @@ Run each check and report. You'll seed a test match (a subscriber whose `target_
   aws lambda invoke --function-name flight-parser \
     --payload '{"origin":"TPE","destination":"TYO","route":"TPE-TYO"}' out.json \
     --region us-east-1
-  # read the consumer's logs (the MCP rejects `logs tail` — use filter-log-events):
+  # read the consumer's logs (AWS MCP: logs FilterLogEvents):
   aws logs filter-log-events --log-group-name /aws/lambda/flight-fare-notification \
     --query "events[].message" --region us-east-1
   ```

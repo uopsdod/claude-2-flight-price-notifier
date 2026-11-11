@@ -41,7 +41,7 @@ Resend is a hosted REST API; the calling code (the Lambda) runs identically in b
 **Why:** This is the same **two-host gap** that shapes the AWS deploy ([[aws-best-practice]] *Cowork execution constraints*): the sandbox has tools but no network to arbitrary hosts; the connectors (AWS MCP) have network but aren't a shell. A GET check (like the Travelpayouts token URL) sneaks through the agent's web-fetch — but Resend needs a **POST + `Authorization` header + body**, which web-fetch can't do and the sandbox can't route. Students hit a confusing `blocked-by-allowlist / 403 on CONNECT` and think their key is wrong; it isn't — the *path* is wrong.
 
 **How to apply:**
-- **Verify the key in the prereq** by deploying a tiny **`flight-resend-test`** Lambda (inline CFN, reads `flight/resend`, POSTs to Resend) and invoking it via the AWS MCP — the Lambda runs *inside AWS* and has internet. Read the result from its **logs** (`filter-log-events`) + your inbox, not the invoke output (the MCP can't read that file). See [[m1-3-email-on-target-prerequisites]] Step 1.
+- **Verify the key in the prereq** by deploying a tiny **`flight-resend-test`** Lambda (inline CFN, reads `flight/resend`, POSTs to Resend) and invoking it via the AWS MCP — the Lambda runs *inside AWS* and has internet. Read the returned `Payload` (AWS MCP returns it inline), its **logs** (`logs FilterLogEvents`) and your inbox. See [[m1-3-email-on-target-prerequisites]] Step 1.
 - **The real alert** is sent the same way — from `flight-fare-notification`, a Lambda. That's why M1.3's design never sends from the browser or the sandbox.
 - **Zero-code alternative for a pure key check:** the **Resend dashboard → Emails → Send** button (no network needed from your side at all).
 
