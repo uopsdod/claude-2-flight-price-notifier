@@ -25,7 +25,7 @@ Build the complete **free** notifier in one pass: **subscribe → fetch on a sch
 
 - "啟動 M1" / "start M1" / "做機票降價通知器" / "build the flight price checker" (or the older "啟動 M1.1/M1.2/M1.3").
 
-**Before Part 1.1, confirm `m0-landing-and-signin-checklist` is green and `m1-flight-price-checker-prerequisites` is complete** (project + AWS access via the `[default]` profile + the `flight/travelpayouts` and `flight/resend` secrets). If not, load those first.
+**Before Part 1.1, confirm `m0-landing-and-signin-checklist` is green and `m1-flight-price-checker-prerequisites` is complete** (project + AWS access via the AWS MCP connector + the `flight/travelpayouts` and `flight/resend` secrets). If not, load those first.
 
 ## Execution mode: Cowork (default) vs CLI
 
