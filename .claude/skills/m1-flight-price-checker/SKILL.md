@@ -29,7 +29,7 @@ Build the complete **free** notifier in one pass: **subscribe → fetch on a sch
 
 ## Execution mode: Cowork (default) vs CLI
 
-This course runs mainly in **Cowork** — you talk to a Cowork agent with the **AWS API MCP** and paste the **`ask """ … """`** blocks below to it verbatim. On the local Claude CLI instead, run the equivalent `aws`/`zip` commands directly. Every AWS command uses `--region us-east-1`; the `[default]` profile means **no `--profile` flag**.
+This course runs mainly in **Cowork** — you talk to a Cowork agent with the **AWS MCP** connector (it runs each `aws …` line's API operation via `call_boto3`) and paste the **`ask """ … """`** blocks below to it verbatim. On the local Claude CLI instead, run the equivalent `aws`/`zip` commands directly. Every AWS command uses `--region us-east-1`; the `[default]` profile means **no `--profile` flag**.
 
 > **Read [[aws-best-practice]] *Cowork execution constraints* once before you deploy.** The connector is usually **`aws`-only** (no shell, no `zip`, no file authoring). Two deploy methods follow from that: **Method 1 — inline CFN `Code.ZipFile`** for a single file ≤4096 chars (Part 1.1's Lambdas); **Method 2 — the `flight-seed` base64→S3 bridge** for anything bigger (Part 1.2's parser, Part 1.3's notification Lambda). MCP quirks you'll hit: `logs tail` and `cloudformation wait` are **rejected** (use `filter-log-events` / poll `describe-stacks`); `lambda invoke --payload` is **raw, not base64**; you **can't `cat` an invoke's output file** (verify by effect); **JMESPath backtick literals** fail (use `SecretList[].Name`, not `SecretList[?starts_with(Name,\`flight/\`)]`).
 

@@ -13,7 +13,7 @@ By the end the student has:
 
 1. A v1 landing page (`/`) for **Flight Price Notifier** — a hero (「設定航線與目標價，機票降價就通知你」), three feature cards (盯緊熱門航線 / 達標自動通知 / 隨時取消), a top-right Sign in / 登入 button, a footer — plus an authenticated `/app` shell that greets the signed-in user and shows a "dashboard coming soon" placeholder.
 2. A **GitHub repo** (created by Lovable) holding that code, made **public**.
-3. A **Cowork desktop project** with **AWS API MCP**, **Vercel Connect**, and **Supabase Connector** installed — this is the workbench every later milestone uses.
+3. A **Cowork desktop project** with **AWS MCP**, **Vercel Connect**, and **Supabase Connector** installed — this is the workbench every later milestone uses.
 4. The **GitHub PAT cached in AWS Secrets Manager**, so this and every later session **recall the same token to modify the repo** instead of re-pasting one.
 5. A **live Vercel URL** that auto-deploys the repo on every push.
 6. **Auth wired up** — register / log in / log out. v1 starts on **Lovable Cloud** (fastest path to a working sign-up), then **swaps to the student's own Supabase project**. Either way **auth is the ONLY thing Supabase does** — only the default `auth.users`; no app data ever lives in Supabase (subscriptions go to DynamoDB on AWS from M1.1 on).
@@ -32,9 +32,9 @@ Do NOT load this skill for M1.1+ — they have their own skills.
 
 ## Execution mode (Cowork-first)
 
-This milestone is written for **Cowork on Desktop** — that's the course's primary environment, and Steps 5–6 set up the Cowork project and its connectors. The **one** part that needs a local shell is writing `~/.aws/credentials` (Step 5), and you hand the student a Claude Code CLI / desktop prompt for exactly that. Everywhere else, the AWS/Vercel/Supabase **connectors** do the work from inside Cowork.
+This milestone is written for **Cowork on Desktop** — that's the course's primary environment, and Steps 5–6 set up the Cowork project and its connectors. Nothing needs a local shell: AWS connects through the **AWS MCP** browser sign-in (Step 5.2), and the AWS/Vercel/Supabase **connectors** do the work from inside Cowork.
 
-If a student is on a pure local CLI instead, the `aws …` commands shown here apply directly (they're the same calls the AWS MCP makes); the connector-install bullets become "make sure `gh` / `vercel` / `aws` are authenticated locally."
+If a student is on a pure local CLI instead, the `aws …` commands shown here apply directly (they're the same calls the AWS MCP makes); the connector-install bullets become "make sure `gh` / `vercel` / `aws` are authenticated locally" (`aws sso login` or `aws configure` for AWS).
 
 ## Required external accounts
 
@@ -42,7 +42,7 @@ If a student is on a pure local CLI instead, the `aws …` commands shown here a
 |---|---|---|
 | 1 | Lovable (`lovable.dev`) | Generates the v1 UI + scaffolds auth |
 | 2 | GitHub | Lovable creates a repo here; you make it public; Vercel imports from it. A **fine-grained PAT** (single repo, Contents: Write) gets cached in Secrets Manager (Step 6) |
-| 3 | AWS | **Secrets Manager** holds the GitHub token (and, later, the Supabase values) so future sessions reuse them. Reached via the **AWS API MCP** connector (Cowork) or the `[default]` profile (CLI) |
+| 3 | AWS | **Secrets Manager** holds the GitHub token (and, later, the Supabase values) so future sessions reuse them. Reached via the **AWS MCP** connector (Cowork, browser sign-in) or your local `aws` CLI login (CLI) |
 | 4 | Vercel | Auto-deploys the GitHub repo; reached via the **Vercel Connect** connector |
 | 5 | Supabase (`supabase.com`) | `auth.users`, sign up / sign in / sign out; reached via the **Supabase Connector** |
 
@@ -167,14 +167,17 @@ This is where the course moves into **Cowork on Desktop** — the workbench ever
 - Turn on **Act without asking**.
 - Settings → **Capabilities**, turn on the memory features: **Search and reference chats**, **Generate memory from chat history**, **Connector discovery**.
 
-**5.2 — AWS connector (the only part that touches a local shell).**
-1. In the **AWS Console as the root user** of the course account: **IAM → Users → Create user** (suggested name `admin-for-project-3-flight-price-notifier-001`) → attach **`AdministratorAccess`** → create. Then **Security credentials → Create access key → "Command Line Interface (CLI)"** → copy the **Access key ID + Secret** (shown once).
-2. **Open a Claude Code CLI / desktop session** (not Cowork) and paste this, filling in the two values:
-   > I have new AWS credentials I want to configure. Please write them to my AWS credentials file. Access key ID: `XXXXX`. Secret access key: `XXXXX`. First, detect whether I'm on Mac/Linux or Windows to determine the correct credentials file path (`~/.aws/credentials` on Mac/Linux, `%USERPROFILE%\.aws\credentials` on Windows), then write the `[default]` profile with the new values — preserving any other existing profiles in the file. Once done, test the connection using `aws sts get-caller-identity`.
-3. Back in **Cowork → Customize → Connectors → search "AWS API MCP" → Install.**
-4. Sanity-check from Cowork: *"How many IAM users do I have now on my AWS account?"* — a number means the connector reads the `[default]` creds.
+**5.2 — AWS connector (AWS MCP, browser sign-in — no access key).**
+AWS MCP signs you in through your browser (OAuth): **no IAM user to create, no access key, no `~/.aws/credentials`, no local shell.**
+1. Make sure you can sign in to the course AWS account as the **root user** (the email + password you signed up with).
+2. Cowork → **Customize → Connectors**. If **AWS API MCP** is installed, **disable** it (the old access-key connector — don't run both).
+3. **Add → AWS MCP**, server URL: `https://aws-mcp.us-east-1.api.aws/mcp?oauth=initialize`
+4. **Continue → Add → Connect → Continue** → wait for **Connecting…**
+5. **Sign into new session** → a browser window opens → sign in as the **root user**.
+6. When Cowork shows **Needs approval** → **Always allow**.
+7. Sanity-check from Cowork: *"How many IAM users do I have now on my AWS account?"* — a number (0 is normal on a fresh account) means the connector works. If Claude says the AWS tool isn't available or the sign-in expired, redo steps 4–6.
 
-> ⚠️ Root is used **once** (to make the admin user); never use root keys after. Revoke the access key at course end.
+> At course end there's no key to revoke — remove the AWS MCP connector in Customize → Connectors to cut access.
 
 **5.3 — Vercel connector.**
 - Sign in to vercel.com first.
