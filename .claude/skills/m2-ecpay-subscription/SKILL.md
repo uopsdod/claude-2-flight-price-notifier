@@ -256,7 +256,7 @@ curl -s -X POST "<api>/cancel" -H "content-type: application/json" \
 
 > **Subscription lifecycle (one line to remember):** `pending_payment → active ⇄ (target updates) → cancelled (grace, still alerted) → expired`. Re-subscribe+pay goes `expired/pending_payment → active`. Full state machine: [[ecpay-best-practice]] Rule 9.
 
-> **Deploy convention (Cowork):** these Lambdas deploy as **single-file `index.handler`** via inline CloudFormation (≤4096 chars) or the **`flight-seed`/`flight-assemble` base64→S3 bridge** for bigger zips — **not** `aws/<fn>/handler.py` + `zip --zip-file fileb://` (the Cowork sandbox has no AWS network route). Any zip over ~1.5 KB MUST go chunked-with-ETag-verification — see [[aws-best-practice]] (a single long base64 `--payload` silently corrupts; only an ETag==md5 gate catches it). The live M2 sources are single-file.
+> **Deploy convention (Cowork):** these Lambdas deploy as **single-file `index.handler`** via **Method A** in [[aws-best-practice]] (an ASCII-safe zip passed straight to `Code.ZipFile`, any size) — or inline CloudFormation (≤4096 chars) — **not** `aws/<fn>/handler.py` + `zip --zip-file fileb://` (the Cowork sandbox has no AWS network route, and AWS MCP corrupts any byte ≥ `0x80`, so a normal zip can't be passed through `call_boto3`). The live M2 sources are single-file.
 
 ## Things to watch out for
 
