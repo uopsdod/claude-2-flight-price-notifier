@@ -53,7 +53,7 @@ DNS + dashboards mostly (Vercel, Resend, registrar). `vercel` CLI / MCP for doma
 
 From `m3-domain-prerequisites` you already know **where the DNS is** (a **Route 53** hosted zone you edit via the AWS MCP, or an external registrar). Carry that forward and use the subdomain hosts above.
 
-> **DNS edits in Route 53:** every record below is an **`UPSERT`** via `aws route53 change-resource-record-sets --hosted-zone-id <id> --change-batch '{…}'` — never a blind create that could clobber an existing record. **Multi-value records (TXT) must include ALL existing values plus the new one** in a single `UPSERT` (Route 53 replaces the whole record set). If the zone is in a different AWS account than the flight project, switch the `[default]` profile to the **domain account** for these steps.
+> **DNS edits in Route 53:** every record below is an **`UPSERT`** via `aws route53 change-resource-record-sets --hosted-zone-id <id> --change-batch '{…}'` — never a blind create that could clobber an existing record. **Multi-value records (TXT) must include ALL existing values plus the new one** in a single `UPSERT` (Route 53 replaces the whole record set). If the zone is in a different AWS account than the flight project, sign the AWS MCP connector into the **domain account** for these steps (check with `sts GetCallerIdentity`) *(not yet re-tested on AWS MCP)*.
 
 ### Step 2 — Attach the host to Vercel
 
@@ -116,7 +116,7 @@ Setup is done. **Run [[m3-domain-checklist]]** (the student can say 「驗收 M3
 2. **Never overwrite multi-value records** — `_vercel` TXT and SPF/DKIM TXT can already hold other values; in Route 53 `UPSERT` the record set with **all** values (existing + new), or you'll break the other project's verification (Step 2/3).
 3. **Don't flip the Resend `from` secret before the domain is Verified** — rejected / spam until SPF+DKIM are live (Step 3).
 4. **Cache-bust after changing `flight/resend`** — the Lambda caches the secret in warm containers; force a cold start or you'll see a stale-`from` `403` even though the secret is right (Step 3.5). This is the #1 confusing trap.
-5. **Multi-account** — if the Route 53 zone and the flight project are in **different AWS accounts**, switch the `[default]` profile between DNS steps (domain account) and secret/Lambda steps (project account). For a single-account student, ignore.
+5. **Multi-account** — if the Route 53 zone and the flight project are in **different AWS accounts**, sign the **AWS MCP** connector into the **domain account** for DNS steps and back into the **project account** for secret/Lambda steps (Customize → Connectors → AWS MCP → reconnect → sign in to that account), and run `sts GetCallerIdentity` before each phase to confirm which account is active *(not yet re-tested on AWS MCP)*. For a single-account student, ignore.
 6. **CORS stays `*` in this course (intentional)** — M3 does **not** lock CORS to the domain; `AllowOrigins: ["*"]` already allows the new domain, so nothing breaks and there's no CORS step. (Per-origin locking is a later hardening choice, not part of M3.) Note the ECPay **callback** routes are hit server-to-server, so CORS never applies to them anyway.
 7. **You do NOT need to domain-map the API Gateway** — ECPay callbacks happily stay on `*.execute-api…` (invisible to users). Branded callback URLs are optional ACM+mapping work, not a requirement.
 8. **DNS propagation** — records can take a few minutes; if the first check fails, wait and retry (the checklist handles this).

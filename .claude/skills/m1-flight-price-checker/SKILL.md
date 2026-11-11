@@ -25,13 +25,13 @@ Build the complete **free** notifier in one pass: **subscribe → fetch on a sch
 
 - "啟動 M1" / "start M1" / "做機票降價通知器" / "build the flight price checker" (or the older "啟動 M1.1/M1.2/M1.3").
 
-**Before Part 1.1, confirm `m0-landing-and-signin-checklist` is green and `m1-flight-price-checker-prerequisites` is complete** (project + AWS access via the `[default]` profile + the `flight/travelpayouts` and `flight/resend` secrets). If not, load those first.
+**Before Part 1.1, confirm `m0-landing-and-signin-checklist` is green and `m1-flight-price-checker-prerequisites` is complete** (project + AWS access via the AWS MCP connector + the `flight/travelpayouts` and `flight/resend` secrets). If not, load those first.
 
 ## Execution mode: Cowork (default) vs CLI
 
-This course runs mainly in **Cowork** — you talk to a Cowork agent with the **AWS API MCP** and paste the **`ask """ … """`** blocks below to it verbatim. On the local Claude CLI instead, run the equivalent `aws`/`zip` commands directly. Every AWS command uses `--region us-east-1`; the `[default]` profile means **no `--profile` flag**.
+This course runs mainly in **Cowork** — you talk to a Cowork agent with the **AWS MCP** connector (it runs each `aws …` line's API operation via `call_boto3`) and paste the **`ask """ … """`** blocks below to it verbatim. On the local Claude CLI instead, run the equivalent `aws`/`zip` commands directly. Every AWS command uses `--region us-east-1` (`region_name="us-east-1"` in AWS MCP scripts).
 
-> **Read [[aws-best-practice]] *Cowork execution constraints* once before you deploy.** The connector is usually **`aws`-only** (no shell, no `zip`, no file authoring). Two deploy methods follow from that: **Method 1 — inline CFN `Code.ZipFile`** for a single file ≤4096 chars (Part 1.1's Lambdas); **Method 2 — the `flight-seed` base64→S3 bridge** for anything bigger (Part 1.2's parser, Part 1.3's notification Lambda). MCP quirks you'll hit: `logs tail` and `cloudformation wait` are **rejected** (use `filter-log-events` / poll `describe-stacks`); `lambda invoke --payload` is **raw, not base64**; you **can't `cat` an invoke's output file** (verify by effect); **JMESPath backtick literals** fail (use `SecretList[].Name`, not `SecretList[?starts_with(Name,\`flight/\`)]`).
+> **Read [[aws-best-practice]] *Cowork execution constraints* once before you deploy.** The one rule that bites: **AWS MCP silently corrupts every byte ≥ `0x80`** in blob parameters (S3 bodies, `Code.ZipFile`, invoke payloads), so only ASCII goes through `call_boto3`. Deploy methods: **Method A — ASCII-safe zip → `Code.ZipFile`** (recommended, any size: Part 1.2's parser/wrapper, Part 1.3's notification Lambda); **Method B — inline CFN** still works for Part 1.1's small Lambdas as written. Other AWS MCP behavior: `Invoke` returns the payload inline (read it directly); logs via `logs FilterLogEvents`; wait by polling with `asyncio.sleep` inside the script; filter results in Python (no `--query`).
 
 ## Architecture
 
@@ -70,7 +70,7 @@ The same system as a text fallback:
  Repo loop:  Landing Page (Lovable) ──▶ Repo (GitHub) ──R──▶ Product Site (Vercel)
 ```
 
-> **Deploy-time only (not in the runtime flow):** a tiny **`flight-seed` λ** exists solely to land the routes JSON + the >4096-char function zips in S3 (the `aws`-only connector can't upload objects otherwise). It plays no part once the system runs.
+> **Deploy-time only:** on AWS MCP the routes JSON goes into S3 with a plain-text `PutObject`, and function code goes straight into `Code.ZipFile` (Method A). The old **`flight-seed`** bridge Lambda is no longer part of M1; it's kept in [[aws-best-practice]] (Method C) only for binary bytes.
 
 ---
 
@@ -128,7 +128,7 @@ aws iam put-role-policy --role-name flight-lambda-role --policy-name flight-data
 ```
 This one shared role is reused by **all** of M1's Lambdas. **No SNS, no VPC.** Parts 1.2/1.3 *extend* this same `flight-data` policy (S3 + SQS + InvokeFunction) — you'll merge those in as you reach them. **Verify:** `aws iam get-role --role-name flight-lambda-role` succeeds.
 
-### Step 4 — Write & deploy `flight-save-subscription` (inline CFN — Method 1)
+### Step 4 — Write & deploy `flight-save-subscription` (inline CFN — Method B)
 
 The handler takes `{email, plan_name, target_price}`, maps `plan_name`→`(origin,destination)`, builds `route = origin-destination`, and `PutItem`s the row — **no `subscription_status` in M1**. boto3 is in the runtime (no layer).
 ```python
@@ -209,7 +209,7 @@ ask """
 >
 Update the inline policy `flight-data` on role `flight-lambda-role` to ALSO allow (add as new statements, keep existing):
 >
-- `s3:GetObject` and `s3:PutObject` on `arn:aws:s3:::flight-config-<ACCOUNT_ID>/*` (Get: wrapper reads routes; Put: the flight-seed bridge writes objects in Step 9)
+- `s3:GetObject` and `s3:PutObject` on `arn:aws:s3:::flight-config-<ACCOUNT_ID>/*` (Get: wrapper reads routes; Put: kept for the optional `flight-seed` bridge — Method C in [[aws-best-practice]])
 >
 - `sqs:SendMessage` and `sqs:GetQueueUrl` on `arn:aws:sqs:us-east-1:<ACCOUNT_ID>:flight-fare-queue`
 >
@@ -277,57 +277,27 @@ _sqs.send_message(QueueUrl=QURL, MessageBody=json.dumps(body))
 ```
 **Currency roles:** TWD primary (gate, subject, headline); USD supplementary only. Additive/backward-compatible. **Caveats:** two TP calls/route (2× `429` exposure — USD failure omits the block, never blocks); the two responses are **independent** (may be different flights / not exact FX — label 約); API param lowercase, message uppercase; same token for both.
 
-### Step 9 — Deploy via the `flight-seed` S3 bridge (Method 2)
+### Step 9 — Deploy the routes config + the two Lambdas (AWS MCP, Method A)
 
-The `aws`-only connector can't author files / `zip` / inline an `s3 put-object` body, so a tiny **`flight-seed`** Lambda base64-decodes bytes into S3.
+On AWS MCP, text goes into S3 directly and function code goes straight into `Code.ZipFile` as an ASCII-safe zip ([[aws-best-practice]] Method A) — no bridge Lambda, no 4096-char cap.
 
-**9a — Deploy `flight-seed` once** (inline CFN — it's tiny):
-
-ask """
->
-Create a one-off `flight-seed` Lambda via inline CloudFormation in us-east-1 (replace <ACCOUNT_ID>). Handler `index.handler`, Runtime python3.12, Role `arn:aws:iam::<ACCOUNT_ID>:role/flight-lambda-role`, Timeout 30. Code (escape for the template):
->
-```python
-import base64, boto3
-def handler(e, c):
-    boto3.client("s3").put_object(Bucket=e["bucket"], Key=e["key"], Body=base64.b64decode(e["b64"]), ContentType=e.get("ct","application/octet-stream"))
-    return {"ok": True, "key": e["key"]}
-```
->
-Then poll `aws cloudformation describe-stacks --stack-name flight-seed --query "Stacks[0].StackStatus" --region us-east-1` until CREATE_COMPLETE (the connector can't use `cloudformation wait`).
->
-"""
-
-**9b — Seed the routes JSON + the two zips** (build each zip in the sandbox, `base64 -w0`, invoke the bridge with **raw JSON**):
+**9a — Write the routes config to S3** (plain text, so it arrives intact):
 
 ask """
 >
-Land three objects in S3 via flight-seed, us-east-1 (replace <ACCOUNT_ID>). RAW JSON payload — only the `b64` field is base64:
->
-1. routes config — `b64` = base64 of `[{"plan":"tokyo","origin":"TPE","destination":"TYO"},{"plan":"seoul","origin":"TPE","destination":"SEL"}]`:
-   `aws lambda invoke --function-name flight-seed --payload '{"bucket":"flight-config-<ACCOUNT_ID>","key":"flight-routes.json","b64":"<BASE64>","ct":"application/json"}' /tmp/aws-api-mcp/workdir/out.json --region us-east-1`
->
-2. parser zip — `zip -j parser.zip index.py && base64 -w0 parser.zip` → `key":"lambda/parser.zip"`, `ct":"application/zip"`.
->
-3. wrapper zip — same → `key":"lambda/wrapper.zip"`.
->
-Then verify each landed and **the zip ETag == the local md5** (NOT just size — a same-length single-char corruption passes a size check): `aws s3api head-object --bucket flight-config-<ACCOUNT_ID> --key lambda/parser.zip --query "ETag" --region us-east-1`. For a big paste, chunk it (see [[aws-best-practice]] Method 2). Read the routes back: `aws s3 cp s3://flight-config-<ACCOUNT_ID>/flight-routes.json - --region us-east-1`.
+In one AWS MCP script (us-east-1, replace <ACCOUNT_ID>): `s3 PutObject` to bucket `flight-config-<ACCOUNT_ID>`, key `flight-routes.json`, ContentType `application/json`, Body = the **string** `[{"plan":"tokyo","origin":"TPE","destination":"TYO"},{"plan":"seoul","origin":"TPE","destination":"SEL"}]`. Then `GetObject` it back and show me the body.
 >
 """
 
-**9c — Create both functions from S3:**
+**9b — Create both functions with Method A:**
 
 ask """
 >
-Create both Lambdas pointing Code at S3, us-east-1 (replace <ACCOUNT_ID>). Same role, python3.12, handler `index.handler`, env `CONFIG_BUCKET=flight-config-<ACCOUNT_ID>`:
->
-`aws lambda create-function --function-name flight-parser --runtime python3.12 --handler index.handler --role arn:aws:iam::<ACCOUNT_ID>:role/flight-lambda-role --timeout 30 --environment 'Variables={CONFIG_BUCKET=flight-config-<ACCOUNT_ID>}' --code S3Bucket=flight-config-<ACCOUNT_ID>,S3Key=lambda/parser.zip --region us-east-1`
->
-Repeat for `flight-parser-wrapper` with `--timeout 60` and `S3Key=lambda/wrapper.zip`.
+Deploy `flight-parser` and `flight-parser-wrapper` with Method A from [[aws-best-practice]] (the `ascii_zip` helper → `lambda CreateFunction` with `Code.ZipFile`), us-east-1, replace <ACCOUNT_ID>. Both: runtime python3.12, handler `index.handler`, role `arn:aws:iam::<ACCOUNT_ID>:role/flight-lambda-role`, env `CONFIG_BUCKET=flight-config-<ACCOUNT_ID>`. Timeout 30 for the parser, 60 for the wrapper. Retry on the IAM-propagation error, poll `GetFunction` until `State` is `Active`, then show me both functions' `State`, `CodeSize` and `LastUpdateStatus`.
 >
 """
 
-> **Redeploy:** re-seed (9b) → `aws lambda update-function-code --s3-bucket … --s3-key …`. A function stuck `State=Failed` from a bad zip → **delete + recreate**. *(CLI: `zip -j parser.zip index.py` + `create-function --zip-file fileb://…`.)*
+> **Redeploy:** `UpdateFunctionCode` with `ZipFile = ascii_zip(<new source>)`, then poll until `LastUpdateStatus == "Successful"`. A function stuck `State=Failed` from a bad zip → **delete + recreate**. *(CLI: `zip -j parser.zip index.py` + `aws lambda create-function --zip-file fileb://parser.zip …`.)*
 
 **Verify** — invoke the parser, read the **logs** (`filter-log-events`, not `logs tail`):
 ```bash
@@ -375,7 +345,7 @@ Missing → run the prereq's Resend step. (Sending stays from `onboarding@resend
 
 ### Step 12 — Write the `flight-fare-notification` consumer
 
-A **single self-contained `index.py`** (you write the renderer inline). **Too big for inline CFN** (~5–6 KB + mixed quote types break CFN escaping) → deploys via the **S3 bridge** (Method 2), like the parser. Per SQS message:
+A **single self-contained `index.py`** (you write the renderer inline). **Too big for inline CFN** (~5–6 KB + mixed quote types break CFN escaping) → deploys with **Method A** (ASCII-safe zip → `Code.ZipFile`), like the parser. Its Chinese email text is auto-escaped to `\uXXXX` by `ascii_zip()` — keep it in normal string literals (not `r"…"`). Per SQS message:
 1. Read `flight/resend` (api_key + `from`).
 2. **`Query notification_history`** on `pk=f"{email}#{route}"`, newest first, limit 1.
    - **Key schema:** `pk` (HASH, S) + `sent_at` (RANGE, S — **ISO-8601 UTC string**). `ScanIndexForward=False, Limit=1` → the latest. **Don't** store `sent_at` as an epoch Number (breaks the range-key type / ordering).
@@ -439,13 +409,13 @@ A recent `sent_at`+`price`; the immediate re-run skipped; the big-drop wrote a n
 1. **No payment guard in M1** — no `subscription_status` anywhere; everyone who subscribes is eligible. The paywall (status + payment confirmation + active-only parser filter) is **M2**.
 2. **CORS + no-AWS-creds-in-front-end** — set CORS on the HTTP API; the browser only POSTs to API Gateway; only Lambdas touch AWS (the Supabase publishable key in the front-end is fine — public, auth-only).
 3. **Decimal, not float** — `target_price`/`price` to DynamoDB as `Decimal(str(x))`; convert back for JSON ([[aws-best-practice]] Rule 3).
-4. **Deploy method by size** — 1-file ≤4096 chars → inline CFN; bigger (parser, notification) → the `flight-seed` S3 bridge, **verify by ETag==md5** (size misses a same-length corruption).
+4. **Deploy method** — Method A (ASCII-safe zip → `Code.ZipFile`) for any size; never pass a normal zip or any non-ASCII bytes through `call_boto3` (bytes ≥ `0x80` are silently corrupted). Part 1.1's inline CFN still works as written.
 5. **Parse the API's real keys** — `departure_at`/`return_at`, not `depart_date`/`return_date`, or you get silently-empty fares.
 6. **TWD primary, USD supplementary** — gate/dedup/headline on `cheapest` (TWD); render 約US$ only when `cheapest_usd` is present.
 7. **SQS: all three consumer perms + VisibilityTimeout > timeout + purge before mapping** — miss a perm → silent no-poll; equal timeout → mid-flight redelivery; stale messages drain on mapping creation.
 8. **Resend: drop permanent (403/422), retry transient (429/5xx); custom User-Agent (Cloudflare 1010); send to your Resend-account email on the demo sender** — see [[resend-best-practice]].
 9. **`notification_history` dedup BEFORE send**, write the row **only after a 2xx** — the at-least-once-safe ordering.
-10. **MCP gotchas** — inline CFN (no `fileb://`), verify-by-effect (no `cat`), `filter-log-events` (not `logs tail`), poll `describe-stacks` (not `cloudformation wait`), raw `--payload`, no JMESPath backticks, clone into a native dir.
+10. **AWS MCP gotchas** — binary bytes ≥ `0x80` silently corrupted (ASCII only), `zipfile`/`hashlib`/`base64` blocked in the script sandbox (use the `ascii_zip` helper), `Invoke` payload returned inline, `logs FilterLogEvents` (quote patterns with `-`), poll with `asyncio.sleep` (no `wait`), retry `CreateFunction` on IAM propagation, clone into a native dir.
 
 ## Expected duration
 
@@ -461,5 +431,5 @@ When `m1-flight-price-checker-checklist` is green: 「M1 完成！你有一個�
 - Travelpayouts `/v1/prices/cheap`: https://travelpayouts.github.io/slate/ — `data[<DEST>][<idx>]` with `price`/`airline`/`departure_at`/`return_at`.
 - EventBridge: https://docs.aws.amazon.com/eventbridge/ · SQS: https://docs.aws.amazon.com/sqs/ · Resend: https://resend.com/docs/api-reference/emails/send-email
 - `fetch_cheapest` + the renderer are written **inline** in their Lambdas; `flightproxy/email_render.py` in the repo is the renderer reference spec.
-- [[aws-best-practice]] — Cowork execution constraints (Method 1 inline / Method 2 seed-bridge + ETag), Decimal, region discipline, IAM-merge, SQS visibility timeout.
+- [[aws-best-practice]] — Cowork execution constraints (ASCII-only bytes; Method A ASCII-safe zip / Method B inline CFN / Method C seed-bridge + ETag), Decimal, region discipline, IAM-merge, SQS visibility timeout.
 - [[resend-best-practice]] — demo-sender-to-self, verified-`from`, dedup-before-send, html+text, Cloudflare UA, 5 req/s, permanent-vs-transient, no-VPC.

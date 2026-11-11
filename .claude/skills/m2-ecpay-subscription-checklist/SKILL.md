@@ -15,7 +15,7 @@ Confirms the paywall really works end-to-end: recurring checkout → callback (C
 
 ## Execution mode
 
-Mainly **Cowork** — paste checks to the agent with the **AWS API MCP**; CLI runs the same `aws` lines. All commands `--region us-east-1`, `[default]` profile. MCP rules that bite here: **verify by effect** (can't `cat` an `invoke`/output file — read the DynamoDB row or the logs instead); **`filter-log-events`**, not `logs tail`; **no JMESPath backtick literals** (use `SecretList[].Name`, scan the list). There is **no `ecpay` CLI or MCP** — ECPay-side steps are driven from the **廠商後台** (模擬付款 button + 信用卡定期定額訂單查詢) and from a real **stage test-card** run in the browser. The `POST` checks (`/subscribe`, `/cancel`, `/ecpay-result`) are **mode-dependent**: Cowork can't POST (no shell with AWS net; the web tool is GET-only) → prove those by their **effect** (the DynamoDB row + the callback logs) and by driving the live form in the browser. CLI can run the `curl` lines directly.
+Mainly **Cowork** — paste checks to the agent with the **AWS MCP** (it runs each `aws` line's API operation via `call_boto3`); CLI runs the same `aws` lines. All commands `--region us-east-1`. AWS MCP behavior that matters here: `Invoke` returns the payload inline, but **still verify by effect** (read the DynamoDB row or the logs); logs via **`logs FilterLogEvents`**; filter results in Python (no `--query`). See [[aws-best-practice]] *Cowork execution constraints*. There is **no `ecpay` CLI or MCP** — ECPay-side steps are driven from the **廠商後台** (模擬付款 button + 信用卡定期定額訂單查詢) and from a real **stage test-card** run in the browser. The `POST` checks (`/subscribe`, `/cancel`, `/ecpay-result`) are **mode-dependent**: Cowork can't POST (no shell with AWS net; the web tool is GET-only) → prove those by their **effect** (the DynamoDB row + the callback logs) and by driving the live form in the browser. CLI can run the `curl` lines directly.
 
 ## How to run
 
@@ -23,7 +23,7 @@ Run each check and report. Ask the student for: the API Gateway base URL, the li
 
 > **⚠️ Use the Resend-account owner's email as the test subscriber for B3 / C1 / E1.** While `flight/resend` still sends from `onboarding@resend.dev` (pre-M3, no verified domain), the Resend **sandbox only delivers to the account owner's own verified address** — any other recipient `403`s `validation_error` and the welcome/cancel email silently never arrives. So set the subscriber email to **your Resend-account email** (e.g. `uopsaoa@gmail.com`) — the examples below write `<your-resend-account-email>`; substitute that address everywhere. Using a throwaway like `pay@test.com` here would make C1/E1's email checks fail for the wrong reason. (See [[ecpay-best-practice]] watch-out 16.)
 
-Subscription rows are the authoritative source — read them with `aws dynamodb get-item` (works identically via the AWS API MCP).
+Subscription rows are the authoritative source — read them with `aws dynamodb get-item` (works identically via the AWS MCP — `dynamodb GetItem`).
 
 ### Section A — ECPay checkout form
 - **A1** The `flight/ecpay` secret exists with stage `merchant_id` + an `amount` (our implemented price is `300` = NT$300; any integer the student chose is acceptable): `aws secretsmanager get-secret-value --secret-id flight/ecpay --region us-east-1 --query SecretString --output text`.
@@ -103,7 +103,7 @@ Subscription rows are the authoritative source — read them with `aws dynamodb 
     curl -s -X POST "<api>/cancel" -H "content-type: application/json" -d '{"email":"<your-resend-account-email>","route":"TPE-TYO"}'
     ```
   - **Cowork** (can't POST): click **取消訂閱** in the live app UI for that subscriber instead.
-  - **Both** then read the authoritative row (works via the AWS API MCP):
+  - **Both** then read the authoritative row (works via the AWS MCP — `dynamodb GetItem`):
     ```bash
     aws dynamodb get-item --table-name subscriptions \
       --key '{"email":{"S":"<your-resend-account-email>"},"route":{"S":"TPE-TYO"}}' \

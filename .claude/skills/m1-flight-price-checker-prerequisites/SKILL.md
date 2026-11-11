@@ -31,9 +31,9 @@ The four credentials you confirm/collect here are what make this diagram run:
   Match case-insensitively on substrings, not exact names. If two candidates match (e.g. a stray duplicate), read both and prefer the one whose shape is right; mention the ambiguity to the student rather than guessing silently.
 - **Tolerate the *shape*, not just the name.** A past M0 run may have stored a credential as **bare-string** rather than JSON (real example: `github/personal-access-token` holds the raw `github_pat_…`, not `{"pat":…}`), or used a different field name (`anon_key` vs `publishable_key`). So **don't hard-fail on a `json.load`** — if it doesn't parse as JSON, treat the raw value as the credential; and match key fields by their value pattern, not an exact field name. Identify the secret by *what the value looks like*, not its envelope.
 - **One part at a time, conversationally.** End each part by confirming success and announcing the next part. Never ask for two different keys in the same message.
-- **You run all the AWS/git commands** via the AWS API MCP + git tool. The student never runs `aws` themselves.
-- **Every AWS command:** `--region us-east-1`, `[default]` profile (no `--profile`).
-- **Read [[aws-best-practice]] *Cowork execution constraints* once** before you deploy anything. Two facts shape this skill: (1) the common AWS connector is **`aws`-only** (no shell/`zip`/file authoring) → Lambda code deploys via **inline CFN** (small) or the **`flight-seed` S3 bridge** (big); (2) the **sandbox can't reach arbitrary hosts** (`api.resend.com` is proxy-blocked) → anything that POSTs to a third party runs **from a Lambda**, not the sandbox. This is why Resend is verified from a Lambda (Part D).
+- **You run all the AWS/git commands** via the AWS MCP + git tool. The student never runs `aws` themselves. AWS commands in this skill are written in `aws` CLI form for readability; in Cowork, run the same API operation through AWS MCP's `aws___run_script` / `call_boto3` (PascalCase `operation_name`, e.g. `ListSecrets`).
+- **Every AWS call:** `us-east-1` (`region_name="us-east-1"` in Cowork, `--region us-east-1` in CLI).
+- **Read [[aws-best-practice]] *Cowork execution constraints* once** before you deploy anything. Two facts shape this skill: (1) AWS MCP **silently corrupts every byte ≥ `0x80`** in blob parameters → Lambda code deploys as an **ASCII-safe zip** (Method A) or via **inline CFN** (Method B, used for the small test Lambda below); (2) the **sandbox can't reach arbitrary hosts** (`api.resend.com` is proxy-blocked) → anything that POSTs to a third party runs **from a Lambda**, not the sandbox. This is why Resend is verified from a Lambda (Part D).
 
 **The four secrets M1 relies on — two are M0 carryovers, two are new here.** The "looks like" column is what you scan `list-secrets` for; the M0 ones may sit under *any* name the M0 run chose, so match by substring + shape, not exact name:
 
@@ -68,37 +68,28 @@ Echo it back to confirm. If you couldn't auto-identify the GitHub repo, ask for 
 
 ## Part A — AWS access (already wired in M0 — just confirm)
 
-**AWS was set up in M0 (Step 5)** so the GitHub token could be cached. So **don't walk the student through IAM again by default — just confirm it still works:**
-```bash
-aws sts get-caller-identity --query Account --output text --region us-east-1
-```
+**AWS was set up in M0 (Step 5.2 — the AWS MCP connector)** so the GitHub token could be cached. So **don't walk the student through setup again by default — just confirm it still works:** run `sts GetCallerIdentity` through the AWS MCP (`aws___run_script`, `region_name="us-east-1"`).
 - Returns an account ID → "✅ AWS is still wired from M0." Skip straight to Part B.
-- Errors (`[default]` profile missing/expired) → *then* fall back to the one-time setup below.
+- The AWS tools are missing, or the call fails with a sign-in / auth error → *then* fall back to the one-time setup below.
 
-<details><summary><strong>Fallback — first-time AWS setup (only if the check above failed)</strong></summary>
+<details><summary><strong>Fallback — connect AWS MCP (only if the check above failed)</strong></summary>
 
-This is the only part the student does outside Cowork — because writing `~/.aws/credentials` needs a local Claude Code CLI session (the Cowork connector then reads those creds). **Walk them through it, then wait for them to confirm AWS is live before continuing.**
+AWS MCP signs in through the browser (OAuth): **no IAM user, no access key, no `~/.aws/credentials`, no local shell.** If the session merely expired, steps 4–6 are enough. **Walk them through it, then wait for them to confirm before continuing.**
 
 **Tell the student, step by step (pause between):**
 
-1. **Install the AWS API MCP connector** in Cowork: *Customize → Connectors → search "AWS API MCP" → Install.*
-2. **In the AWS Console, as the root user** of their course account:
-   - **IAM → Users → Create user** (suggest `admin-for-cowork`) → attach **`AdministratorAccess`** → create.
-   - That user → **Security credentials → Create access key → "Command Line Interface (CLI)"** → copy the **Access key ID + Secret** (shown once).
-3. **Open a Claude Code CLI session** (not Cowork) and paste this prompt **there** — fill in the two values:
+1. Make sure you can sign in to the course AWS account as the **root user** (the email + password you signed up with).
+2. Cowork → **Customize → Connectors**. If **AWS API MCP** is installed, **disable** it (the old access-key connector — don't run both).
+3. **Add → AWS MCP**, server URL: `https://aws-mcp.us-east-1.api.aws/mcp?oauth=initialize`
+4. **Continue → Add → Connect → Continue** → wait for **Connecting…**
+5. **Sign into new session** → a browser window opens → sign in as the **root user**.
+6. When Cowork shows **Needs approval** → **Always allow**.
 
-   > I have new AWS credentials to configure. Access key ID: `<YOUR_ACCESS_KEY_ID>`. Secret access key: `<YOUR_SECRET_ACCESS_KEY>`. Detect Mac/Linux vs Windows for the right path (`~/.aws/credentials` or `%USERPROFILE%\.aws\credentials`), write the **`[default]`** profile with these values (preserving any other existing profiles), then test with `aws sts get-caller-identity`.
-
-4. **Come back to Cowork and tell me when `aws sts get-caller-identity` worked.**
-
-**Then YOU verify it from Cowork** before moving on:
-```bash
-aws sts get-caller-identity --query Account --output text --region us-east-1
-```
+**Then YOU verify it from Cowork** before moving on: re-run `sts GetCallerIdentity` through the AWS MCP.
 - Returns an account ID → say "✅ AWS is wired — now I can cache your keys. Next: GitHub." and go to Part B.
-- Errors → the `[default]` profile isn't written yet; have them redo step 3 in the CLI.
+- Still fails → have them redo steps 4–6 (the browser sign-in).
 
-> ⚠️ Remind them: **root is used only once** (to make the admin user); never use root keys after. Revoke the access key at course end.
+> If the student set up the old way in M0 (an IAM user `admin-for-cowork` / `admin-for-project-3-…` with an access key in `~/.aws/credentials`), that key is no longer needed — once AWS MCP works, deactivate and delete it in IAM → Users → Security credentials.
 
 </details>
 
@@ -221,7 +212,7 @@ aws sts get-caller-identity --query Account --output text --region us-east-1    
 aws secretsmanager list-secrets --region us-east-1 --query "SecretList[].Name"                # scan the inventory; confirm a github-ish, supabase-ish, travelpayouts, and resend secret are all present (don't assume exact names)
 ```
 Confirm to the student, in plain language:
-- ✅ **AWS** wired (`[default]` profile) — carried over from M0.
+- ✅ **AWS** wired (AWS MCP connector) — carried over from M0.
 - ✅ **All four credentials present in Secrets Manager:** the GitHub + Supabase secrets (**discovered + reused from M0**, whatever names they sit under) and the new Travelpayouts + Resend ones (**cached this run** as `flight/travelpayouts` / `flight/resend`) — *you'll never have to paste any of these again; I look them up in Secrets Manager every session.*
 - ✅ **Travelpayouts** `"success":true`; ✅ **Resend** test email arrived.
 

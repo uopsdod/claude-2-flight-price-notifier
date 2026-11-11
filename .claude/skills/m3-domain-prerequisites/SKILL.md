@@ -45,16 +45,16 @@ Existing apex `A` / `www` `CNAME` (or any live project records) → **apex is in
 
 ### ⚠️ Multi-account: the Route 53 zone may be in a DIFFERENT AWS account than the flight resources
 
-The AWS MCP uses a single `[default]` profile. In a real setup the **domain (Route 53)** and the **flight project (Lambdas/secrets/API Gateway)** can live in **different AWS accounts** — so you'll **switch the `[default]` profile** between *DNS steps* (domain account) and *secret/Lambda steps* (project account). Identify both up front:
-- Which account/profile holds the **Route 53 zone** → used for all DNS record changes.
-- Which account/profile holds **`flight/*` secrets + the Lambdas + `flight-api`** → used for the `put-secret-value`, cold-start, etc.
+The AWS MCP is signed in to one AWS account at a time. In a real setup the **domain (Route 53)** and the **flight project (Lambdas/secrets/API Gateway)** can live in **different AWS accounts** — so you'll sign the **AWS MCP** connector into the **domain account** for DNS steps and back into the **project account** for secret/Lambda steps (Customize → Connectors → AWS MCP → reconnect → sign in to that account), and run `sts GetCallerIdentity` before each phase to confirm which account is active *(not yet re-tested on AWS MCP)*. Identify both up front:
+- Which account holds the **Route 53 zone** → used for all DNS record changes.
+- Which account holds **`flight/*` secrets + the Lambdas + `flight-api`** → used for the `put-secret-value`, cold-start, etc.
 - For a **student** this is usually **one** account — flag the two-account case as the advanced variant. (See [[aws-best-practice]].)
 
 ### Bind a SUBDOMAIN by default — don't ask, never clobber the apex
 
 **Default to a dedicated subdomain** for the flight project — `fly.yourdomain.com` for the site and `mail.yourdomain.com` for the Resend sender — **even when the apex is free, and without asking the student.** It avoids clobbering another project on the same domain, sidesteps the apex-`A` record and the "same apex verified in two Resend accounts" collision, and — the big one — **doesn't force the student to re-verify a domain they may already have set up, which would delay the build** (see [[m3-domain]] Step 1/3). Every DNS write is an **`UPSERT`/append**, never a blind overwrite — multi-value records (like `_vercel` TXT) must be appended to, not replaced (see [[m3-domain]] Step 2). Only use the bare apex if the student explicitly asks for it. Decide the exact host(s) here so the later steps use them consistently.
 
-**Verify:** you know (a) the exact host(s) you'll bind (a subdomain by default), and (b) where their DNS lives (Route 53 account/profile, or an external registrar the student can edit).
+**Verify:** you know (a) the exact host(s) you'll bind (a subdomain by default), and (b) where their DNS lives (which Route 53 account, or an external registrar the student can edit).
 
 ## Step 2 — Confirm M2 carryover (the product works on the Vercel URL)
 
@@ -63,7 +63,7 @@ The AWS MCP uses a single `[default]` profile. In a real setup the **domain (Rou
 curl -sS -o /dev/null -w "%{http_code}\n" https://<your>.vercel.app          # 200
 # ECPay callback Lambdas exist (M2)
 for fn in flight-ecpay-return flight-ecpay-period; do aws lambda get-function --function-name $fn --region us-east-1 --query 'Configuration.FunctionName'; done
-# resend + ecpay secrets exist (list all names + scan — backtick JMESPath filters error through the AWS API MCP)
+# resend + ecpay secrets exist (AWS MCP: `ListSecrets`, then scan the names in Python)
 aws secretsmanager list-secrets --region us-east-1 --query "SecretList[].Name"   # flight/travelpayouts, /resend, /ecpay, + the cache /github, /supabase
 ```
 If the paid flow isn't working on the Vercel URL yet, finish M2 first — M3 only changes the *address*, not the logic.

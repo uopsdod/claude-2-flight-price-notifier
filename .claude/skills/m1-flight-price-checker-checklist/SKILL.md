@@ -9,7 +9,7 @@ Verify the whole free notifier end-to-end, then emit a single **READY for M2** v
 
 ## Execution mode
 
-Mainly **Cowork** — paste checks to the agent with the **AWS API MCP**; CLI runs the same `aws` lines. All commands `--region us-east-1`, `[default]` profile. MCP rules that bite here: **verify by effect** (can't `cat` an `invoke` output file); **`filter-log-events`**, not `logs tail`; **no JMESPath backtick literals** (use `SecretList[].Name`). Ask the student for: the API Gateway base URL, the live Vercel URL, and a real inbox = their **Resend-account email**.
+Mainly **Cowork** — paste checks to the agent with the **AWS MCP** (it runs each `aws` line's API operation via `call_boto3`); CLI runs the same `aws` lines. All commands `--region us-east-1`. MCP rules that bite here: **verify by effect** (can't `cat` an `invoke` output file); **`filter-log-events`**, not `logs tail`; **no JMESPath backtick literals** (use `SecretList[].Name`). Ask the student for: the API Gateway base URL, the live Vercel URL, and a real inbox = their **Resend-account email**.
 
 ## Architecture
 
@@ -58,11 +58,11 @@ This checklist verifies every box in that diagram. The compact flow below maps e
 ### Section F — Config + queue + deploy artifacts
 - **F1** S3 routes load: `aws s3 cp s3://flight-config-<ACCOUNT_ID>/flight-routes.json - --region us-east-1` → the two routes.
 - **F2** Fare queue exists: `aws sqs get-queue-url --queue-name flight-fare-queue --region us-east-1`.
-- **F3** Zips in S3 with **ETag == local md5** (NOT just size — a same-length single-char corruption passes a size check): `aws s3 ls s3://flight-config-<ACCOUNT_ID>/lambda/ --region us-east-1` lists `parser.zip`+`wrapper.zip`; compare each `aws s3api head-object … --query "ETag"` to the local `md5`.
+- **F3** Deployed code is healthy: `lambda GetFunction` for `flight-parser` and `flight-parser-wrapper` shows `State=Active`, `LastUpdateStatus=Successful` and a non-zero `CodeSize`. (Only if a zip was deployed from S3 via the `flight-seed` bridge: also require that object's **ETag == the local md5** — a same-length one-character corruption passes a size check.)
 
 ### Section G — Parser Lambdas run
 - **G1** Both exist: `aws lambda get-function --function-name flight-parser …` and `flight-parser-wrapper`.
-- **G2** Parser invoke clean — verify **by logs**, not the output file: `aws lambda invoke --function-name flight-parser --payload '{"origin":"TPE","destination":"TYO","route":"TPE-TYO"}' out.json --region us-east-1`. `Runtime.ImportModuleError` = bad S3 zip (re-seed, check ETag); `AccessDeniedException` = role merge dropped a statement.
+- **G2** Parser invoke clean — read the returned `Payload` (AWS MCP returns it inline) and the logs: `aws lambda invoke --function-name flight-parser --payload '{"origin":"TPE","destination":"TYO","route":"TPE-TYO"}' out.json --region us-east-1`. `Runtime.ImportModuleError` = bad S3 zip (re-seed, check ETag); `AccessDeniedException` = role merge dropped a statement.
 - **G3** Realistic fares in logs: `aws logs filter-log-events --log-group-name /aws/lambda/flight-parser --query "events[].message" --region us-east-1` → a sane TWD fare (Tokyo ~NT$8–12k, Seoul ~NT$5–8k). Empty fares despite a live route = wrong API keys (`departure_at`/`return_at`, not `depart_date`/`return_date`).
 
 ### Section H — Match + enqueue (no payment guard)
@@ -108,7 +108,7 @@ This checklist verifies every box in that diagram. The compact flow below maps e
 | C2 subscription row (no status) | ✅/❌ | authoritative |
 | D2 form → row (live) | ✅/❌ | the key 1.1 one (POST+CORS) |
 | E2 subscribed-state shows | ✅/❌ | closed loop |
-| F1/F2/F3 routes+queue+zips (ETag) | ✅/❌ | verify ETag, not size |
+| F1/F2/F3 routes+queue+deployed code | ✅/❌ | State Active + LastUpdateStatus Successful |
 | G2/G3 parser runs, realistic fares | ✅/❌ | filter-log-events |
 | H1/H2 match → enqueued, body dual-currency | ✅/❌ | cheapest=TWD always, usd optional |
 | H3/H4/H5 USD best-effort / no guard / below-target | ✅/❌ | |
@@ -124,6 +124,6 @@ This checklist verifies every box in that diagram. The compact flow below maps e
 - All ✅ → 「M1 驗收通過 ✅ 你有一個能動的*免費*降價通知器了。READY for M2。跟我說『啟動 M2』來加上付款門檻。」
 - Any ❌ → name the failures + recovery:
   - **1.1:** CORS → set on the HTTP API; no row → Lambda `put_item` + IAM DynamoDB + Decimal; subscribed-state missing → add `GET /subscriptions` + the dashboard fetch.
-  - **1.2:** `Runtime.ImportModuleError`/`InvalidZipFileException` → re-seed via `flight-seed`, verify **ETag==md5**; `State=Failed` → delete+recreate; empty fares → check `departure_at`/`return_at` keys + token + `CONFIG_BUCKET`; nothing enqueued → `Scan` filter (route only) + SQS SendMessage perm.
+  - **1.2:** `Runtime.ImportModuleError`/`InvalidZipFileException`/`Uploaded file must be a non-empty zip` → the zip had bytes ≥ `0x80`; redeploy with Method A (`ascii_zip`) ([[aws-best-practice]]); `State=Failed` → delete+recreate; empty fares → check `departure_at`/`return_at` keys + token + `CONFIG_BUCKET`; nothing enqueued → `Scan` filter (route only) + SQS SendMessage perm.
   - **1.3:** no email → recipient = **Resend-account** email + the 3 consumer SQS perms + custom User-Agent (Cloudflare 1010) + dedup logic; duplicate sent → dedup window / history write; permanent-failure loop (403/422) → drop, don't redeliver, purge stale messages.
   Then re-run `驗收 M1`. (See [[aws-best-practice]] + [[resend-best-practice]] for the failure modes.)
