@@ -5,7 +5,7 @@ description: Hard rules and operational SOP for the AWS side of the Flight Price
 
 # AWS Best Practice (Flight Price Notifier — serverless)
 
-This course's AWS side is **100% serverless** — there is **no EC2, no SSH, no SSM, no systemd**. The pieces are: **6 Lambdas**, **2 DynamoDB tables** (`subscriptions`, `notification_history`), **2 SQS queues**, an **S3** routes config, **API Gateway (HTTP API v2)**, **EventBridge**, and **Secrets Manager**. AWS access is the **`[default]` profile** (IAM user `admin-for-cowork` with `AdministratorAccess`), read by the **AWS API MCP** in Cowork; every command pins **`--region us-east-1`**.
+This course's AWS side is **100% serverless** — there is **no EC2, no SSH, no SSM, no systemd**. The pieces are: **6 Lambdas**, **2 DynamoDB tables** (`subscriptions`, `notification_history`), **2 SQS queues**, an **S3** routes config, **API Gateway (HTTP API v2)**, **EventBridge**, and **Secrets Manager**. AWS access in Cowork is the official **AWS MCP** connector, signed in through the browser (OAuth — no IAM user, no access key); every command pins **`--region us-east-1`** (`region_name="us-east-1"` in AWS MCP scripts).
 
 When guiding a student through AWS operations, **apply these rules proactively** — stop them before they break one. Each rule maps to a real failure mode of *this* stack.
 
@@ -19,48 +19,144 @@ The hard rules apply identically in both — only the command surface differs.
 
 | Operation | CLI mode | Cowork mode |
 |---|---|---|
-| Run any AWS API call | `aws <service> <verb> ... --region us-east-1` | `call_aws <service> <verb> ...` via AWS API MCP (set region/creds in the connector) |
-| Deploy a 1-file Lambda | `aws lambda create-function --zip-file fileb://fn.zip ...` | inline CFN `Code.ZipFile` (Method 1 below) — no file transfer |
-| Deploy a >4096-char / layered Lambda | `zip` the dir → `--zip-file fileb://fn.zip` | S3 via the `flight-seed` base64 bridge → `Code.S3Bucket/S3Key` (Method 2 below) |
-| Read a Lambda's logs | `aws logs tail /aws/lambda/<fn> --since 10m --follow` | `aws logs filter-log-events --log-group-name /aws/lambda/<fn> --query "events[].message"` (the MCP rejects `logs tail`) |
-| Inspect a DynamoDB row | `aws dynamodb get-item --table-name subscriptions --key '{...}'` | `call_aws dynamodb get-item ...` |
+| Run any AWS API call | `aws <service> <verb> ... --region us-east-1` | AWS MCP `aws___run_script` → `await call_boto3(service_name="<service>", operation_name="<PascalCaseOperation>", region_name="us-east-1", params={...})` |
+| Deploy a source-only Lambda (any size) | `aws lambda create-function --zip-file fileb://fn.zip ...` | `ascii_zip()` in the script → `lambda CreateFunction` / `UpdateFunctionCode` with `Code.ZipFile` (**Method A** below) |
+| Land binary bytes in S3 (a dependency zip, an image) | `aws s3 cp file s3://…` | the `flight-seed` base64 bridge (**Method C** below) — `call_boto3` corrupts binary bodies |
+| Land a text object in S3 (`flight-routes.json`) | `aws s3 cp` | `s3 PutObject` with a **str** `Body` — text bodies arrive intact |
+| Read a Lambda's logs | `aws logs tail /aws/lambda/<fn> --since 10m --follow` | `logs FilterLogEvents` (`logGroupName="/aws/lambda/<fn>"`); quote any `filterPattern` containing `-` |
+| Inspect a DynamoDB row | `aws dynamodb get-item --table-name subscriptions --key '{...}'` | `dynamodb` `GetItem` via AWS MCP |
 
-**Profile/region:** the course uses the **`[default]`** AWS profile (no `--profile` flag needed). It has **no default region**, so **every** call passes `--region us-east-1`. In Cowork the AWS API MCP reads `~/.aws/credentials`'s `[default]` block (written via a Claude CLI session — see [[m1-1-subscribe-to-a-plan-prerequisites]]). Forgetting the region is the #1 "it works for me but not in the script" gap.
+**Region:** **every** call passes `us-east-1` (`--region us-east-1` in CLI, `region_name="us-east-1"` in AWS MCP scripts). Forgetting the region is the #1 "it works for me but not in the script" gap. In Cowork, AWS access is the AWS MCP browser sign-in — nothing on disk; CLI mode uses the student's local `aws` login.
 
 ---
 
 ## Cowork execution constraints (read before you deploy)
 
-In Cowork there are **two separate hosts**, and the gap between them — **not** an auth gap — is what bites:
+*Verified on AWS MCP (`aws___run_script` / `call_boto3`) on 2026-11-11 with throwaway `mcp-test-*` resources.* Two hosts are involved, and neither can simply hand the other a file:
 
-- **The AWS API MCP** *does* have AWS access: it authenticates from `~/.aws/credentials` (the `[default]` profile written in prereqs) and runs `aws` calls. **Creds and network are fine.** But — verified on a real M1.2 run — the common connector is **`aws`-CLI-only: it executes `aws` API commands and nothing else.** It has **no shell**, so it **cannot author files, run `zip`, or `cat` an output** in any workdir. (Some connector builds *do* expose a writable workdir; **don't assume it** — see the capability fork below.)
-- **The bash/build sandbox** is a *different* host. It can build a zip, but has **no AWS creds and no network route to AWS** (DNS to `*.amazonaws.com` is blackholed; s3/sts/lambda return **HTTP 000**), and **no shared path to the connector** — so it can't hand the built zip to the MCP, and can't upload to S3 itself.
+- **The AWS MCP sandbox** (`aws___run_script`) has AWS access and returns results inline, but it is **not a full Python**: `zipfile`, `hashlib`, `os`, `struct`, `base64` and `exec()` are **blocked**, and it has **no network except `call_boto3`**.
+- **The Cowork bash sandbox** has `zip`/`base64`, but **no route to AWS** (a presigned-URL PUT fails at the proxy with `CONNECT tunnel failed, response 403`).
 
-So you **cannot** get a built zip to S3 by any direct path: the sandbox has the file but no network; the MCP has the network but can't author the file. The bridge that closes this gap is a tiny **`flight-seed` Lambda** (Method 2 below). Other gotchas from real runs:
+What that means in practice:
 
-1. **The zip-transfer gap (above):** no direct file→S3 path. → single small files deploy **inline** (Method 1); anything bigger goes through the **`flight-seed` base64→S3 bridge** (Method 2).
-2. **The build sandbox has no AWS network:** `curl`/uploads to AWS from it return **HTTP 000**; the web-fetch tool is **GET-only**.
-3. **You can't read MCP-written files.** `aws lambda invoke … out.json` writes the response body where you **can't `cat` it back**. **Verify the effect instead** — `get-item` (DynamoDB), a queue depth, or `logs filter-log-events`.
-4. **The MCP's command surface ≠ the full CLI.** It runs core AWS **API operations**, not the CLI's convenience wrappers or client-side binary handling. Verified rejections/quirks (every milestone inherits these):
-   - `aws logs tail` → **rejected** ("operation 'tail' does not exist"). Use **`aws logs filter-log-events --log-group-name … --query "events[].message"`** (optional `--start-time <epoch_ms>`).
-   - `aws cloudformation wait …` → **rejected** ("operation 'wait' is not allowed"). **Poll** `describe-stacks --query "Stacks[0].StackStatus"` until `CREATE_COMPLETE` (sleep between calls).
-   - `aws lambda invoke` → **rejects `--query` and `--cli-binary-format`.** And **`--payload` is forwarded RAW, not base64** — send plain JSON (`'{"k":"v"}'`); base64-encoding it fails with `InvalidRequestContentException`.
-   - **JMESPath backtick literals fail to parse** anywhere (`SecretList[?starts_with(Name,\`flight/\`)]` → "Unknown token"). Use plain projections: `--query "SecretList[].Name"`.
-   - **`s3api put-object` Body can't be inlined.** `--cli-input-json '{"Body":"…"}'` is a streaming blob the CLI **silently drops → a 0-byte object**, and there's **no `--body <file>`** to point at without a shell. This is *why* the `flight-seed` bridge exists, not a clever one-liner.
-5. **Git on the mounted folder fails.** `git clone`/ops in the mounted workspace folder error (`config.lock: Operation not permitted` — FUSE can't do git's locking). **Clone into a native dir** (the agent's home); treat the working copy as **ephemeral** — GitHub + Vercel are the source of truth.
+1. **🔴 Binary is silently corrupted.** Every blob parameter passed through `call_boto3` (`s3 PutObject` `Body`, `lambda` `Code.ZipFile`, `Invoke` `Payload`) goes through a lossy UTF-8 decode: bytes `0x00–0x7F` survive, **every byte ≥ `0x80` becomes U+FFFD**. The call still **succeeds**. Measured: a 51,425-byte zip was stored as 93,000 bytes with a wrong ETag; a normal zip passed to `CreateFunction` failed with `InvalidParameterValueException: Uploaded file must be a non-empty zip`. → **Only ever send bytes that are all < `0x80`** (ASCII text, ASCII JSON, or the ASCII-safe zip from Method A).
+2. **🟢 Text works.** `s3 PutObject` with a `str` body lands intact (ETag == md5); `GetObject` returns text readable in-script.
+3. **🟢 Results come back inline.** `lambda Invoke` returns the response `Payload` as a readable string — no output file to `cat`. `LogResult` is included.
+4. **🟢 Logs:** `logs FilterLogEvents` works. Gotcha: an unquoted `filterPattern` like `mcp-test` matches nothing (`-test` means "exclude"); quote it: `"\"mcp-test invoked\""`.
+5. **🟢 Waiting:** poll inside one script with `await asyncio.sleep(…)` (e.g. `GetFunction` until `State == "Active"`, `DescribeStacks` until `CREATE_COMPLETE`). There is no CLI `wait`, and you don't need one.
+6. **🟢 No JMESPath.** There is no `--query`; filter the response in Python (`[s["Name"] for s in resp["SecretList"]]`).
+7. **Booleans are real booleans.** e.g. DynamoDB `Query` newest-first is `"ScanIndexForward": False` in `params` (the old CLI's `--no-scan-index-forward` quirk doesn't apply).
+8. **IAM propagation:** `CreateFunction` right after creating a role fails with `The role defined for the function cannot be assumed by Lambda` — retry in-script with `asyncio.sleep(5)` (worked on the 3rd attempt).
+9. **Git on the mounted folder fails** (`config.lock: Operation not permitted` — FUSE can't do git's locking). **Clone into a native dir** (the agent's home); treat the working copy as **ephemeral** — GitHub + Vercel are the source of truth.
 
-**→ The Cowork way to deploy Lambda code (two methods):**
+**→ Deployed shape ≠ repo layout (state this up front).** Every function in this stack deploys as a **single-file `index.handler`** — *not* the `aws/<fn>/handler.py` + a `common/` package the repo sources suggest. Fold shared helpers (CMV, ddb access) **into each `index.py`** (boto3/stdlib only — the runtime already has boto3). The repo's `aws/` tree can lag the deployed code; treat the deployed function as the source of truth for behavior.
 
-**Method 1 — inline `Code.ZipFile` (single small file).** Send the code *inside* the API call — **CloudFormation with inline `Code.ZipFile`**: `aws cloudformation create-stack --template-body '<json>'`, function code inline, no file transfer. **Limits: single file, ≤4096 chars, handler `index.handler`.** This is how M1.1's one-file Lambdas (`save_subscription`, `list_subscriptions`) deploy — they use only boto3 (already in the runtime), so no extra files.
+**→ The Cowork way to deploy Lambda code:**
 
-**Method 2 — S3 `Code.S3Bucket/S3Key` via the `flight-seed` bridge (>4096 chars or a layer zip).** When a function's code **exceeds the inline 4096-char cap**, or you need to land a **layer zip** (M2's `stripe`+`requests`) or any other bytes in S3, inline won't fit and `s3api put-object` can't take an inline body (see constraint #4). **First check your connector** (capability fork):
+**Method A — ASCII-safe zip, straight into `Code.ZipFile` (recommended, any size).** Build an uncompressed one-file zip in pure Python whose **every byte is < `0x80`** (a salt comment is varied until the CRC, size and offset fields are all ASCII-safe), then pass it to `CreateFunction` / `UpdateFunctionCode`. No CloudFormation, no 4096-char cap (verified with a 4,151-char `index.py`; a ~93 KB payload crossed in one call), no S3 bridge. Non-ASCII characters (e.g. Chinese email text) are auto-escaped to `\uXXXX`, so they must sit in **normal string literals or comments** — not in `r"…"` raw strings or `b"…"` bytes literals. Paste this helper into the script (it uses no imports):
 
-- **`aws`-only connector (the common case):** use the **`flight-seed` bridge** below — it's the only path that works.
-- **Connector with a writable shell workdir (rare):** you *may* instead author the files there, `zip`, and `aws s3 cp` directly — but if you're unsure, use the bridge; it works in both.
+```python
+# --- ascii_zip helper: no imports (AWS MCP sandbox blocks zipfile/hashlib/struct/base64) ---
+_CRC = []
+for _n in range(256):
+    _c = _n
+    for _ in range(8):
+        _c = (0xEDB88320 ^ (_c >> 1)) if (_c & 1) else (_c >> 1)
+    _CRC.append(_c)
 
-**The `flight-seed` base64→S3 bridge** (canonical for `aws`-only connectors):
+def _crc_update(c, data):
+    # running CRC-32 state (start from 0xFFFFFFFF, finish with ^ 0xFFFFFFFF)
+    for b in data:
+        c = _CRC[(c ^ b) & 0xFF] ^ (c >> 8)
+    return c
 
-1. **Deploy a tiny `flight-seed` Lambda once**, via inline CFN `Code.ZipFile` (it fits — it's ~6 lines):
+def _le(n, size):
+    return n.to_bytes(size, "little")
+
+def ascii_zip(source, name="index.py"):
+    """Return an uncompressed one-file zip whose every byte is < 0x80.
+    Non-ASCII characters are escaped (\\uXXXX), so they must sit inside normal
+    (non-raw, non-bytes) string literals or comments."""
+    src = source.encode("ascii", "backslashreplace").decode("ascii")
+    fname = name.encode("ascii")
+    body = src.encode("ascii")
+    body_crc = _crc_update(0xFFFFFFFF, body)          # CRC the source once
+    hdr = 30 + len(fname)                             # local header length
+
+    def safe(n):
+        return all(x < 0x80 for x in n.to_bytes(4, "little"))
+
+    # 1) pick a total file size whose size AND central-directory offset bytes are all < 0x80
+    size = len(body) + 32                             # room for the salt line
+    while not (safe(size) and safe(size + hdr)):
+        size += 1
+    # 2) pad to exactly that size; vary only a fixed-width salt so just the CRC changes
+    for salt in range(100000):
+        head = "\n# zip-salt: %06d " % salt
+        tail = (head + "s" * (size - len(body) - len(head) - 1) + "\n").encode("ascii")
+        data = body + tail
+        crc = _crc_update(body_crc, tail) ^ 0xFFFFFFFF
+        if not safe(crc):
+            continue
+        local = (b"PK\x03\x04" + _le(20, 2) + _le(0, 2) + _le(0, 2)      # version, flags, stored
+                 + _le(0, 2) + _le(0x21, 2)                               # time, date (1980-01-01)
+                 + _le(crc, 4) + _le(size, 4) + _le(size, 4)
+                 + _le(len(fname), 2) + _le(0, 2) + fname)
+        central = (b"PK\x01\x02" + _le(20, 2) + _le(20, 2) + _le(0, 2) + _le(0, 2)
+                   + _le(0, 2) + _le(0x21, 2)
+                   + _le(crc, 4) + _le(size, 4) + _le(size, 4)
+                   + _le(len(fname), 2) + _le(0, 2) + _le(0, 2)          # name, extra, comment
+                   + _le(0, 2) + _le(0, 2) + _le(0, 4)                   # disk, int attr, ext attr
+                   + _le(0, 4) + fname)                                  # local header offset
+        cd_offset = len(local) + size
+        end = (b"PK\x05\x06" + _le(0, 2) + _le(0, 2) + _le(1, 2) + _le(1, 2)
+               + _le(len(central), 4) + _le(cd_offset, 4) + _le(0, 2))
+        blob = local + data + central + end
+        if all(x < 0x80 for x in blob):
+            return blob
+    raise ValueError("no ASCII-safe salt found")
+# --- end helper ---
+```
+
+Then, in the same `aws___run_script` call:
+
+```python
+SOURCE = """<the full index.py>"""
+zip_bytes = ascii_zip(SOURCE)
+ROLE = "arn:aws:iam::<ACCOUNT_ID>:role/flight-lambda-role"
+
+for attempt in range(6):                      # IAM-propagation retry
+    try:
+        await call_boto3(service_name="lambda", operation_name="CreateFunction", region_name="us-east-1",
+                         params={"FunctionName": "flight-parser", "Runtime": "python3.12",
+                                 "Handler": "index.handler", "Role": ROLE, "Timeout": 30,
+                                 "Environment": {"Variables": {"CONFIG_BUCKET": "flight-config-<ACCOUNT_ID>"}},
+                                 "Code": {"ZipFile": zip_bytes}})
+        break
+    except Exception as e:
+        if "cannot be assumed" not in str(e):
+            raise
+        await asyncio.sleep(5)
+
+for _ in range(30):                           # wait until Active
+    fn = await call_boto3(service_name="lambda", operation_name="GetFunction", region_name="us-east-1",
+                          params={"FunctionName": "flight-parser"})
+    if fn["Configuration"]["State"] == "Active":
+        break
+    await asyncio.sleep(2)
+result = {"state": fn["Configuration"]["State"]}
+result
+```
+
+- **Redeploy** = `UpdateFunctionCode` with `{"FunctionName": …, "ZipFile": ascii_zip(SOURCE)}`, then poll `GetFunction` until `LastUpdateStatus == "Successful"`.
+- **Verify by smoke test:** `lambda Invoke` with an ASCII JSON payload (`json.dumps(…)` escapes non-ASCII by default) and read the returned `Payload`.
+- A function whose create **failed** on a bad zip is stuck `State=Failed` — `UpdateFunctionCode` is blocked; **delete and recreate** it.
+
+**Method B — inline CloudFormation `Code.ZipFile` (still works, ≤4096 chars).** `cloudformation CreateStack` with the code inside `TemplateBody` (a text parameter, so the byte corruption doesn't apply). Limits: single file, ≤4096 chars, handler `index.handler`, and careful quote-escaping. Poll `DescribeStacks` in-script until `CREATE_COMPLETE`. Existing course steps that use it (M1.1's small Lambdas, `flight-resend-test`) still work as written; Method A is simpler for anything new.
+
+**Method C — the `flight-seed` base64→S3 bridge (only for real binary).** Needed only when you must land **non-ASCII bytes** in S3 — e.g. a zip with compiled dependencies built in the bash sandbox. The bridge's `Invoke` payload is ASCII JSON, so it survives `call_boto3`:
+
+1. Deploy `flight-seed` once (Method A or B):
    ```python
    import base64, boto3
    def handler(e, c):
@@ -70,30 +166,43 @@ So you **cannot** get a built zip to S3 by any direct path: the sandbox has the 
            ContentType=e.get("ct", "application/octet-stream"))
        return {"ok": True, "key": e["key"]}
    ```
-   Its role needs **`s3:PutObject`** on the target bucket (add it to `flight-lambda-role`, or give `flight-seed` its own role).
-2. **Build each zip in the sandbox** (it has `zip`), then `base64 -w0` it to a single line.
-3. **Materialize each object in S3** by invoking the bridge with **raw JSON** (the MCP forwards `--payload` verbatim — do **not** base64 the payload itself):
-   ```bash
-   aws lambda invoke --function-name flight-seed \
-     --payload '{"bucket":"flight-config-<ACCOUNT_ID>","key":"lambda/parser.zip","b64":"<BASE64_OF_ZIP>","ct":"application/zip"}' \
-     /tmp/aws-api-mcp/workdir/out.json --region us-east-1
-   ```
-   (Use the same bridge to write `flight-routes.json`, layer zips — any bytes.)
-4. **Deploy the function from S3:** `aws lambda create-function --code S3Bucket=flight-config-<ACCOUNT_ID>,S3Key=lambda/parser.zip …` (or CFN `Code:{S3Bucket,S3Key}`). Redeploy after an edit = re-seed the new zip, then `aws lambda update-function-code --s3-bucket … --s3-key …`.
+   Its role needs **`s3:PutObject`** on the target bucket.
+2. In the bash sandbox: build the zip, `base64 -w0` it, and note `md5 -q` of the zip.
+3. `lambda Invoke` `flight-seed` with `Payload = json.dumps({"bucket": …, "key": "lambda/x.zip", "b64": "<BASE64>", "ct": "application/zip"})`.
+4. **HARD RULE: `s3 HeadObject` and require ETag == the local md5 before `CreateFunction`/`UpdateFunctionCode` with `Code.S3Bucket/S3Key`.** The base64 text is copied by the model from the bash output into the script, and long copies have corrupted silently before (same-length one-character substitutions that only the ETag check caught). For a zip over ~1.5 KB, split the base64 into ~600-char pieces aligned to 4-char boundaries, seed each to its own key, check each part's ETag, then join them with a `flight-assemble` Lambda (read the parts in order, `put_object` the concatenation) and check the final ETag.
 
-> **Always verify the uploaded object size == the local zip size** — a mangled base64 paste yields a same-name object that fails at deploy with `InvalidZipFileException`. And a function whose create **failed** on a bad zip is stuck `State=Failed` — `update-function-code` is blocked; you must **delete and recreate** it.
+**→ Reading deployed Lambda source in Cowork: the `flight-srcdump` helper.** "The deployed function is the source of truth" (above) is only useful if you can *read* it — and in Cowork you can't download it directly: `GetFunction` returns a presigned code URL, but neither the AWS MCP script sandbox nor the bash sandbox can fetch it, and the script sandbox can't unzip. So when you need to faithfully **extend** an existing function (e.g. M2 layering `subscription_status` onto M1's `save_subscription`, or the `active`-gate onto the `parser`), deploy a third standing helper alongside `flight-seed`/`flight-assemble`:
 
-This is the standard way to land bytes in S3 from an `aws`-only connector — for both **>4096-char function zips** and the **M2 `stripe`+`requests` layer** (`publish-layer-version --content S3Bucket=…,S3Key=…` after seeding `layer.zip`). Note most M1.x functions actually **fold into a single `index.py`** that only uses boto3/stdlib — they need **no layer**; the reason to use S3 is the size cap (and the checklist's S3-artifact check), not file count.
+```python
+# flight-srcdump — downloads a target function's own deployment zip, extracts the .py,
+# and writes the source to SSM /flight/srcdump/<fn> so you can read it inline.
+import boto3, urllib.request, io, zipfile, json
+def handler(e, c):
+    lam, ssm = boto3.client("lambda"), boto3.client("ssm")
+    url = lam.get_function(FunctionName=e["fn"])["Code"]["Location"]   # presigned; runs INSIDE AWS, so reachable
+    z = zipfile.ZipFile(io.BytesIO(urllib.request.urlopen(url).read()))
+    src = "\n\n# ===== %s =====\n" % e["fn"] + "\n".join(
+        "### FILE: %s\n%s" % (n, z.read(n).decode("utf-8", "replace"))
+        for n in z.namelist() if n.endswith(".py"))
+    ssm.put_parameter(Name="/flight/srcdump/%s" % e["fn"], Value=src[:4096],
+                      Type="String", Overwrite=True)              # 4 KB Standard cap; use Advanced/parts if bigger
+    return {"ok": True, "files": [n for n in z.namelist() if n.endswith(".py")], "bytes": len(src)}
+```
+
+- Its role needs **`lambda:GetFunction`** on the target + **`ssm:PutParameter`** on `/flight/srcdump/*` (add to `flight-lambda-role`).
+- Read it back inline (this the sandbox/MCP *can* do): `aws ssm get-parameter --name /flight/srcdump/flight-save-subscription --query "Parameter.Value" --output text --region us-east-1`.
+- Source over ~4 KB: write `Type=Advanced` (8 KB) or have `flight-srcdump` split into `/flight/srcdump/<fn>/<n>` parts and read them in order (same chunking idea as `flight-assemble`).
+- **Inspect before you modify.** The repo's `aws/` tree can lag the live code (constraint **Deployed shape ≠ repo layout**); dump the deployed source first, edit *that*, then redeploy via Method 2 — don't extend the stale repo copy.
 
 ---
 
 ## Hard rules
 
-### Rule 1 — Pin `--region us-east-1` on every command (the `[default]` profile has no region)
+### Rule 1 — Pin `us-east-1` on every call (`--region` in CLI, `region_name` in AWS MCP)
 
-> **The rule:** No bare `aws ...` without a region. Always `--region us-east-1`. All ARNs hardcode `us-east-1` and the account ID. (No `--profile` flag — the course uses `[default]`.)
+> **The rule:** No bare `aws ...` without a region. Always `--region us-east-1` (AWS MCP: `region_name="us-east-1"`). All ARNs hardcode `us-east-1` and the account ID.
 
-**Why:** The `[default]` profile has no region configured, so a call without `--region` either errors (`You must specify a region`) or, worse, silently hits a *different* default region where none of your resources exist — and you get `ResourceNotFoundException` for a table that demonstrably exists (in us-east-1). The same drift bites ARNs: an EventBridge rule ARN or SQS ARN with the wrong region/account silently never matches. Pin both, everywhere.
+**Why:** A call without an explicit region either errors (`You must specify a region`) or, worse, silently hits a *different* default region where none of your resources exist — and you get `ResourceNotFoundException` for a table that demonstrably exists (in us-east-1). The same drift bites ARNs: an EventBridge rule ARN or SQS ARN with the wrong region/account silently never matches. Pin both, everywhere.
 
 **How to apply:** In `scripts/env.sh`: `REGION=us-east-1; ACCOUNT=<your account id>` and reference `--region "$REGION"` in every script (resolve `ACCOUNT` once via `aws sts get-caller-identity --query Account --output text`). When a call returns "not found" for something you just created, **check the region first** before assuming it wasn't created.
 
@@ -101,7 +210,7 @@ This is the standard way to land bytes in S3 from an `aws`-only connector — fo
 
 ### Rule 2 — Secrets Manager is the single source of truth for EVERY key — so a fresh Cowork session never re-asks
 
-> **The rule:** **All** API keys/tokens live under **`flight/*` in Secrets Manager** — collected **once**, reused forever. The only credential that must persist *locally* is the **`[default]` AWS profile** (it's how the AWS MCP authenticates); everything else is one `get-secret-value` away. So a new Cowork session re-derives every key from AWS instead of asking you to paste them again. **No keys in code, in committed env files, or anywhere the front-end can be scraped for a *write* secret.**
+> **The rule:** **All** API keys/tokens live under **`flight/*` in Secrets Manager** — collected **once**, reused forever. Nothing persists locally: the **AWS MCP connector's browser sign-in** is the only AWS credential; everything else is one `get-secret-value` away. So a new Cowork session re-derives every key from AWS instead of asking you to paste them again. **No keys in code, in committed env files, or anywhere the front-end can be scraped for a *write* secret.**
 
 **The canonical `flight/*` set:**
 
@@ -192,10 +301,10 @@ Test with `stripe listen --forward-to <api>/stripe-webhook` + `stripe trigger ch
 - `04_deploy_lambdas.sh`: `cp flightproxy/travelpayouts.py aws/parser/` and `cp flightproxy/email_render.py aws/fare_notification/` before zipping each function.
 - If you ever need a C-extension dep later, build it with `--platform manylinux2014_x86_64` (or Docker), not on the Mac directly.
 
-**In Cowork** the build-sandbox can't hand a zip to the MCP (see *Cowork execution constraints* above), so:
-- **Small single-file Lambdas** (M1.1's `save_subscription`, `list_subscriptions`; M1.2's `flight-seed`) deploy as **inline CFN `Code.ZipFile`** with **no layer** (they only use boto3/stdlib, in the runtime). M1.2's `parser`/`wrapper` also **fold into one `index.py` each** (inline `fetch_cheapest` + routes-read) — they need no layer either.
-- **Over the 4096-char inline cap** (a big handler, or any layer zip) → land the zip in S3 via the **`flight-seed` base64 bridge** (Method 2 above), then deploy `Code:{S3Bucket,S3Key}`. The reason here is the **size cap** (and the checklist's S3-artifact check), not file count.
-- **The `stripe`+`requests` layer** is an **M2** need, not M1.2. Seed `layer.zip` to S3 the same way, then `publish-layer-version --content S3Bucket=…,S3Key=…`.
+**In Cowork** (see *Cowork execution constraints* above):
+- **Every function folds into one `index.py`** (boto3/stdlib only, in the runtime) and deploys with **Method A** (ASCII-safe zip → `Code.ZipFile`) — any size, no S3 detour.
+- Inline CFN (Method B) still works for the existing ≤4096-char steps; the `flight-seed` bridge (Method C) is only for genuine binary bytes.
+- **The `stripe`+`requests` layer** is an **M2** need, not M1.2. A layer zip is binary, so land it in S3 with the `flight-seed` bridge (Method C), then `PublishLayerVersion` with `Content={S3Bucket,S3Key}`.
 
 ---
 
@@ -209,14 +318,15 @@ Test with `stripe listen --forward-to <api>/stripe-webhook` + `stripe trigger ch
 
 ---
 
-### Rule 8 — Use a dedicated IAM user/role; never root keys; one shared `flight-lambda-role`
+### Rule 8 — Connect via the AWS MCP sign-in (no access keys); one shared `flight-lambda-role`
 
-> **The rule:** AWS access for the CLI/MCP uses a named IAM user (**`admin-for-cowork`**, `AdministratorAccess`) whose access key is written to the `[default]` profile — **never AWS root keys** (root is only used once, to *create* that IAM user). All Lambdas assume one **`flight-lambda-role`** scoped to exactly this project's resources.
+> **The rule:** Cowork reaches AWS only through the **AWS MCP** connector, signed in through the browser ([[m0-landing-and-signin]] Step 5.2) — **no IAM user + access key, no `~/.aws/credentials`, no `AKIA…` key pasted anywhere.** All Lambdas assume one **`flight-lambda-role`** scoped to exactly this project's resources.
 
-**Why:** Root keys can't be scoped, audited per-key, or cleanly rotated — a leak means rotating everything. A named IAM user is auditable and deletable. For the Lambdas, one shared role is fine at course scale; its inline policy is scoped to the two table ARNs, the two queue ARNs, the `flight/*` secrets, the S3 routes prefix, and `lambda:InvokeFunction` on `flight-parser` — **not** `Resource: "*"`.
+**Why:** An access key is a long-lived credential — once it's in a file, a chat, or a screenshot, anyone who sees it has that access until someone revokes it. The OAuth sign-in leaves no key to leak; you cut access by removing the connector. For the Lambdas, one shared role is fine at course scale; its inline policy is scoped to the two table ARNs, the two queue ARNs, the `flight/*` secrets, the S3 routes prefix, and `lambda:InvokeFunction` on `flight-parser` — **not** `Resource: "*"`.
 
 **How to apply:**
-- If an `AKIA…` key is ever pasted into chat / a commit / a screenshot → delete it immediately and issue a new one; anyone who sees it has full access until revoked.
+- If AWS tools disappear or calls fail with a sign-in / auth error → the session expired; reconnect the AWS MCP connector and sign in again. Don't fall back to an access key.
+- A student who set up the old way (IAM user + access key for the old AWS API MCP) → once AWS MCP works, deactivate and delete that key. If an `AKIA…` key is ever pasted into chat / a commit / a screenshot → delete it immediately.
 - Keep the role's policy in `scripts/iam-policy.json` (version-controlled), so it's reproducible.
 - For a course, scoping to specific resource ARNs (not full admin on the role) is the teaching-grade floor; production would split per-Lambda least-privilege.
 
@@ -230,7 +340,7 @@ Everything surfaces in **CloudWatch Logs**, one group per function:
 # CLI mode:
 aws logs tail /aws/lambda/flight-parser --since 15m --follow --region us-east-1
 aws logs tail /aws/lambda/flight-fare-notification --since 15m --region us-east-1
-# Cowork (the MCP rejects `logs tail`) — use filter-log-events:
+# Cowork: AWS MCP `logs FilterLogEvents` (same idea as this CLI line; no `logs tail`):
 aws logs filter-log-events --log-group-name /aws/lambda/flight-parser \
   --query "events[].message" --region us-east-1
 ```

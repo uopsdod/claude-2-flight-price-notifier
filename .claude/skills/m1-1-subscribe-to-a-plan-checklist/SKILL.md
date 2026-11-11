@@ -61,12 +61,12 @@ You (Claude Code) actively run each check and report. Ask the student for: the A
   ```bash
   aws secretsmanager list-secrets --region us-east-1 --query "SecretList[].Name"
   ```
-  Look for `flight/travelpayouts` (and, after the M1.1 prereq, the convenience-cache secrets `flight/github` + `flight/supabase`; the Lambda-runtime keys `flight/resend`/`/stripe`/etc. arrive in later milestones). **Don't** use a backtick JMESPath filter like `SecretList[?starts_with(Name,\`flight/\`)]` — it errors through the AWS API MCP ("Unknown token"); list all names and scan.
+  Look for `flight/travelpayouts` (and, after the M1.1 prereq, the convenience-cache secrets `flight/github` + `flight/supabase`; the Lambda-runtime keys `flight/resend`/`/stripe`/etc. arrive in later milestones). In Cowork (AWS MCP) there's no `--query`: call `ListSecrets` and scan the names in Python.
 - **B2** Role has DynamoDB perms: `aws iam get-role-policy --role-name flight-lambda-role --policy-name flight-data --query 'PolicyDocument.Statement[].Action'`
 - **B3** Lambda exists: `aws lambda get-function --function-name flight-save-subscription --region us-east-1 --query 'Configuration.FunctionName'`
 
 ### Section C — Lambda works (direct invoke)
-- **C1** Plain invoke (no `--query`/`--cli-binary-format` — they fail through the MCP; and don't `cat` the output file — the MCP can't read it back):
+- **C1** Plain invoke (in Cowork, AWS MCP returns the `Payload` inline — read it directly):
   ```bash
   aws lambda invoke --function-name flight-save-subscription \
     --payload '{"body":"{\"email\":\"checklist@test.com\",\"plan_name\":\"tokyo\",\"target_price\":10000}"}' \
