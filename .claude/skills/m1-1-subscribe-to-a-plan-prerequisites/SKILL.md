@@ -111,7 +111,19 @@ Ask the agent: *"How many IAM users do I have now on my AWS account?"* — a num
 
 > At course end there's no key to revoke — remove the AWS MCP connector in Customize → Connectors. If you created an IAM user + access key for the old AWS API MCP, deactivate and delete that key once AWS MCP works.
 
-ste this to the agent (swap in your token):
+## Step 2 — Travelpayouts token
+
+M1.1 (and the fetch API) only need the **token** — collect just that now.
+
+1. Sign up free at https://www.travelpayouts.com/ and connect the **Aviasales** program.
+2. Dashboard → **Profile → API token** → copy the **token**. (https://app.travelpayouts.com/profile/api-token)
+3. (You'll store it as `{"token":…}` in the `flight/travelpayouts` secret during M1.1 Step 2.)
+
+> **Not the marker yet.** The Travelpayouts **marker** (affiliate ID, e.g. `736582`) is only used for **booking-link attribution in the M1.3 alert email** — the fetch API authenticates on the token alone (the token-check URL below returns `"success":true` with no marker). You probably don't have the marker handy now, and forcing it here just means storing a placeholder. **M1.3's prereq collects the marker** and updates this secret when it's actually consumed.
+
+**Verify the token works** — the API accepts the token as a `token=` query param, so it's checkable without a shell:
+
+- **Cowork** (no CLI) — paste this to the agent (swap in your token):
 
   ask """
   >
