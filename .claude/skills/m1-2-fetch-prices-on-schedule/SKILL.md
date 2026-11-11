@@ -30,9 +30,9 @@ Requires M1.1 done (`m1-1-subscribe-to-a-plan-checklist` green) — reuses the s
 
 ## Execution mode: Cowork (default) vs CLI
 
-This course runs mainly in **Cowork** — you talk to a Cowork agent with the **AWS API MCP** (it has AWS creds + network and a writable workdir), and you paste the **`ask """ … """`** blocks below to it verbatim. On the local Claude CLI instead, run the equivalent `aws`/`zip` commands directly. Every AWS command uses `--region us-east-1`; the `[default]` profile means **no `--profile` flag**.
+This course runs mainly in **Cowork** — you talk to a Cowork agent with the **AWS MCP** (it has AWS creds + network and a writable workdir), and you paste the **`ask """ … """`** blocks below to it verbatim. On the local Claude CLI instead, run the equivalent `aws`/`zip` commands directly. Every AWS command uses `--region us-east-1`.
 
-> **The M1.2 deploy difference (read [[aws-best-practice]] *Cowork execution constraints* → "Method 2" first):** M1.1's Lambdas were a single ≤4096-char file, so they deployed as **inline CFN `Code.ZipFile`**. M1.2's `parser` folds into one `index.py` too, but it **runs past the 4096-char inline cap** (the inline `fetch_cheapest` + match logic), so it must deploy **from S3**. The common Cowork **AWS connector runs `aws` commands only** — it can't author files or `zip`, and `s3api put-object` can't take an inline body — so a tiny **`flight-seed` Lambda** base64-decodes the zip into S3 (Step 3), then `create-function --code S3Bucket/S3Key` deploys it. No layer needed — `fetch_cheapest` is stdlib (`urllib`); the `stripe`+`requests` layer is an M2 thing.
+> **The M1.2 deploy difference (read [[aws-best-practice]] *Cowork execution constraints* first):** M1.1's Lambdas were a single ≤4096-char file, so they deployed as **inline CFN `Code.ZipFile`**. M1.2's `parser` folds into one `index.py` too, but it **runs past the 4096-char inline cap**, so it deploys with **Method A** — an ASCII-safe zip passed straight to `Code.ZipFile` (Step 3). AWS MCP silently corrupts every byte ≥ `0x80`, which is why a normal zip can't be used.
 
 ## Architecture
 
@@ -71,7 +71,7 @@ M1.2 **explodes the Flight Fare Checker box** — the parser side of the Subscri
           ▮ grey   = 3rd-party (Travelpayouts) / shared Lambda + Library Layer
 ```
 
-> **Deploy-time only (not in the runtime flow above):** a tiny **`flight-seed` λ** exists solely to land the routes JSON + the function zips in the S3 bucket — the Cowork `aws`-only connector can't upload objects any other way (Step 3). It plays no part once the parser is running.
+> **Deploy-time only:** on AWS MCP the routes JSON goes into S3 with a plain-text `PutObject` and the function code goes straight into `Code.ZipFile` (Step 3) — no helper Lambda is involved.
 
 **Operational sequence (what each Lambda does):**
 
@@ -100,7 +100,7 @@ Run `aws sts get-caller-identity --query Account --output text --region us-east-
 >
 """
 
-Then create the bucket and the fare queue. (The routes JSON and the zips get **uploaded in Step 3** through the `flight-seed` bridge — the `aws`-only connector can't author a file to `s3 cp`, and `s3api put-object` can't take an inline body, so all object uploads go through the bridge.)
+Then create the bucket and the fare queue. (The routes JSON is written in Step 3 with a plain-text `PutObject`.)
 
 ask """
 >
@@ -122,7 +122,7 @@ ask """
 >
 Update the inline policy named `flight-data` on IAM role `flight-lambda-role` so it ALSO allows (keep all existing DynamoDB/Secrets statements — add these as new statements):
 >
-- `s3:GetObject` **and `s3:PutObject`** on `arn:aws:s3:::flight-config-<ACCOUNT_ID>/*` (GetObject: the wrapper reads the routes config; **PutObject: the `flight-seed` bridge writes the routes JSON + zips in Step 3**)
+- `s3:GetObject` **and `s3:PutObject`** on `arn:aws:s3:::flight-config-<ACCOUNT_ID>/*` (GetObject: the wrapper reads the routes config; PutObject: kept for the optional `flight-seed` bridge — Method C in [[aws-best-practice]])
 >
 - `sqs:SendMessage` and `sqs:GetQueueUrl` on `arn:aws:sqs:us-east-1:<ACCOUNT_ID>:flight-fare-queue`
 >
@@ -223,62 +223,31 @@ This is the contract M1.3 consumes. **`cheapest` (TWD) is always present** — i
 - **Casing:** the API param is lowercase (`twd`/`usd`); the message records uppercase (`"TWD"`/`"USD"`).
 - **No new secret** — the same `flight/travelpayouts` token serves both currencies.
 
-### Step 3 — Deploy both Lambdas via the `flight-seed` S3 bridge
+### Step 3 — Deploy the routes config + both Lambdas (AWS MCP, Method A)
 
-The parser's `index.py` is over the 4096-char inline cap, so it deploys **from S3**. But the common Cowork **AWS connector runs `aws` commands only** — it can't author a file or `zip`, the build sandbox has no AWS network, and `s3api put-object` can't take an inline body. The bridge that closes this gap is a tiny **`flight-seed` Lambda** that base64-decodes bytes into S3. (Read [[aws-best-practice]] *Cowork execution constraints* → Method 2 once; **if your connector instead has a writable shell workdir**, you can skip the bridge and `zip`+`s3 cp` directly — but the bridge works either way.)
+The parser's `index.py` is over the 4096-char inline-CFN cap. On AWS MCP that no longer matters: function code goes straight into `Code.ZipFile` as an **ASCII-safe zip** ([[aws-best-practice]] Method A — any size, no S3 detour), and text goes into S3 with a plain `PutObject`. (AWS MCP silently corrupts every byte ≥ `0x80`, so never pass a normal zip through `call_boto3`.)
 
-**3a — Deploy `flight-seed` once** (inline CFN — it's tiny, fits the cap). Paste to the agent:
-
-ask """
->
-Create a one-off `flight-seed` Lambda via inline CloudFormation in us-east-1 (replace <ACCOUNT_ID>). Handler `index.handler`, Runtime python3.12, Role `arn:aws:iam::<ACCOUNT_ID>:role/flight-lambda-role`, Timeout 30. The code (escape it for the template):
->
-import base64, boto3
-def handler(e, c):
-    boto3.client("s3").put_object(Bucket=e["bucket"], Key=e["key"], Body=base64.b64decode(e["b64"]), ContentType=e.get("ct","application/octet-stream"))
-    return {"ok": True, "key": e["key"]}
->
-Then poll `aws cloudformation describe-stacks --stack-name flight-seed --query "Stacks[0].StackStatus" --region us-east-1` until it returns CREATE_COMPLETE (the connector can't use `cloudformation wait`).
->
-"""
-
-> The role already has `s3:PutObject` from Step 1's policy merge — that's what lets `flight-seed` write the bucket.
-
-**3b — Seed the routes config + the two zips through the bridge.** Build each zip in the sandbox (it has `zip`), base64 it, and invoke `flight-seed` to land each object in S3. Paste to the agent:
+**3a — Write the routes config to S3** (plain text, so it arrives intact). Paste to the agent:
 
 ask """
 >
-Land three objects in S3 via the flight-seed bridge, in us-east-1 (replace <ACCOUNT_ID>). Each is a `lambda invoke` with a RAW JSON payload — do NOT base64 the payload itself, only the `b64` field is base64 (this connector forwards --payload verbatim):
->
-1. The routes config — `b64` is base64 of the JSON `[{"plan":"tokyo","origin":"TPE","destination":"TYO"},{"plan":"seoul","origin":"TPE","destination":"SEL"}]`:
-   `aws lambda invoke --function-name flight-seed --payload '{"bucket":"flight-config-<ACCOUNT_ID>","key":"flight-routes.json","b64":"<BASE64_OF_THE_JSON>","ct":"application/json"}' /tmp/aws-api-mcp/workdir/out.json --region us-east-1`
->
-2. The parser zip — in the sandbox: `zip -j parser.zip index.py && base64 -w0 parser.zip`, then:
-   `aws lambda invoke --function-name flight-seed --payload '{"bucket":"flight-config-<ACCOUNT_ID>","key":"lambda/parser.zip","b64":"<BASE64_OF_parser.zip>","ct":"application/zip"}' /tmp/aws-api-mcp/workdir/out.json --region us-east-1`
->
-3. The wrapper zip — same, `key":"lambda/wrapper.zip"`, `b64` = base64 of `wrapper.zip`.
->
-Then confirm all three landed and the zips match the local sizes: `aws s3 ls s3://flight-config-<ACCOUNT_ID>/ --recursive --region us-east-1` — the zip byte sizes must equal the local zips (a mangled base64 paste makes a same-name object that fails at deploy with InvalidZipFileException), and `flight-routes.json` is present. Also read it back: `aws s3 cp s3://flight-config-<ACCOUNT_ID>/flight-routes.json - --region us-east-1` shows the two routes.
+In one AWS MCP script (us-east-1, replace <ACCOUNT_ID>): `s3 PutObject` to bucket `flight-config-<ACCOUNT_ID>`, key `flight-routes.json`, ContentType `application/json`, Body = the **string** `[{"plan":"tokyo","origin":"TPE","destination":"TYO"},{"plan":"seoul","origin":"TPE","destination":"SEL"}]`. Then `GetObject` it back and show me the body.
 >
 """
 
-**3c — Create both functions from S3.** Paste to the agent:
+**3b — Create both functions with Method A.** Paste to the agent:
 
 ask """
 >
-Create both Lambda functions pointing Code at the seeded S3 objects, in us-east-1 (replace <ACCOUNT_ID>). Same role `arn:aws:iam::<ACCOUNT_ID>:role/flight-lambda-role`, Runtime python3.12, Handler `index.handler`, Environment `CONFIG_BUCKET=flight-config-<ACCOUNT_ID>`:
->
-`aws lambda create-function --function-name flight-parser --runtime python3.12 --handler index.handler --role arn:aws:iam::<ACCOUNT_ID>:role/flight-lambda-role --timeout 30 --environment 'Variables={CONFIG_BUCKET=flight-config-<ACCOUNT_ID>}' --code S3Bucket=flight-config-<ACCOUNT_ID>,S3Key=lambda/parser.zip --region us-east-1`
->
-Repeat for `flight-parser-wrapper` with `--timeout 60` and `S3Key=lambda/wrapper.zip`.
+Deploy `flight-parser` and `flight-parser-wrapper` with Method A from [[aws-best-practice]] (the `ascii_zip` helper → `lambda CreateFunction` with `Code.ZipFile`), us-east-1, replace <ACCOUNT_ID>. Both: runtime python3.12, handler `index.handler`, role `arn:aws:iam::<ACCOUNT_ID>:role/flight-lambda-role`, env `CONFIG_BUCKET=flight-config-<ACCOUNT_ID>`. Timeout 30 for the parser, 60 for the wrapper. Retry on the IAM-propagation error, poll `GetFunction` until `State` is `Active`, then show me both functions' `State`, `CodeSize` and `LastUpdateStatus`.
 >
 """
 
-> **Redeploy after a code edit:** re-seed the new zip (3b), then `aws lambda update-function-code --function-name flight-parser --s3-bucket flight-config-<ACCOUNT_ID> --s3-key lambda/parser.zip --region us-east-1`. **If a function got stuck `State=Failed`** from a bad zip, `update-function-code` is blocked — **delete and recreate** it. The deployed zip is the source of truth; the working copy is ephemeral in Cowork.
+> **Redeploy after a code edit:** `UpdateFunctionCode` with `ZipFile = ascii_zip(<new source>)`, then poll until `LastUpdateStatus == "Successful"`. **If a function got stuck `State=Failed`** from a bad zip, `update-function-code` is blocked — **delete and recreate** it. The deployed code is the source of truth; the working copy is ephemeral in Cowork.
 >
-> *(CLI mode: `zip -j parser.zip aws/parser/index.py`, then `aws lambda create-function --zip-file fileb://parser.zip …` — no bridge needed.)*
+> *(CLI mode: `zip -j parser.zip aws/parser/index.py`, then `aws lambda create-function --zip-file fileb://parser.zip …`.)*
 
-**Verify before moving on** — invoke the parser for one route, then read the **effect** (logs), not the invoke output (the MCP can't read the file `invoke` writes; `invoke` also chokes on `--query`/`--cli-binary-format`):
+**Verify before moving on** — invoke the parser for one route, then check the returned `Payload` (AWS MCP returns it inline) and the logs:
 
 ask """
 >
@@ -286,7 +255,7 @@ Invoke the parser for one route and show me its logs:
 >
 `aws lambda invoke --function-name flight-parser --payload '{"origin":"TPE","destination":"TYO","route":"TPE-TYO"}' out.json --region us-east-1`
 >
-then read the logs with filter-log-events (the connector rejects `logs tail`):
+then read the logs (AWS MCP: `logs FilterLogEvents`):
 `aws logs filter-log-events --log-group-name /aws/lambda/flight-parser --query "events[].message" --region us-east-1`
 >
 """
@@ -348,9 +317,9 @@ Then invoke the wrapper once manually so I don't have to wait for the schedule, 
 7. **Token plumbing** — read the `token` from the `flight/travelpayouts` secret and pass it into `fetch_cheapest`; the cheap API authenticates on the token alone.
 8. **Async fan-out** — `parser_wrapper` invokes `parser` with `InvocationType="Event"` so one slow/empty route doesn't block the others.
 9. **Parse the API's real keys** — `data[<DEST>][<idx>]` uses **`departure_at` / `return_at`** (not `depart_date`/`return_date`), plus `price`, `airline`. Parsing the wrong keys → silently empty fares (looks like "no deals" when the API actually returned some).
-10. **Deploy is via the `flight-seed` bridge, not inline** — the parser's `index.py` exceeds the 4096-char inline cap, and the `aws`-only connector can't author files / `zip` / inline an `s3 put-object` body. So: deploy `flight-seed` once (inline), then base64→S3 the zips (Step 3). A mangled base64 → wrong object size → `InvalidZipFileException`; a function stuck `State=Failed` must be **deleted + recreated** (`update-function-code` is blocked). See [[aws-best-practice]] Method 2.
+10. **Deploy is via Method A, not inline** — the parser's `index.py` exceeds the 4096-char inline cap, and AWS MCP corrupts every byte ≥ `0x80`, so deploy an **ASCII-safe zip** straight into `Code.ZipFile` (Step 3). A function stuck `State=Failed` must be **deleted + recreated** (`update-function-code` is blocked). See [[aws-best-practice]] Method A.
 11. **`CONFIG_BUCKET` env var** — both Lambdas read `flight-routes.json` from the bucket named in `CONFIG_BUCKET`; set it at deploy (Step 3c). Missing → the parser_wrapper can't find the routes and fans out to nothing.
-12. **MCP command surface** — `logs tail` and `cloudformation wait` are rejected (use `filter-log-events` / poll `describe-stacks`); `lambda invoke --payload` is **raw, not base64**; no JMESPath backtick literals. (See [[aws-best-practice]] *Cowork execution constraints* #4.)
+12. **AWS MCP behavior** — `Invoke` returns the payload inline; logs via `logs FilterLogEvents`; wait by polling with `asyncio.sleep` inside the script; filter results in Python (no `--query`). (See [[aws-best-practice]] *Cowork execution constraints*.)
 
 ## Expected duration
 
@@ -366,4 +335,4 @@ When `m1-2-fetch-prices-on-schedule-checklist` is green: 「M1.2 完成！系統
 - EventBridge schedules: https://docs.aws.amazon.com/eventbridge/
 - SQS: https://docs.aws.amazon.com/sqs/
 - `fetch_cheapest` is written **inline** in the parser's `index.py` (stdlib `urllib`, no layer) — see Step 2.
-- [[aws-best-practice]] — *Cowork execution constraints* (Method 2: the `flight-seed` base64→S3 bridge + MCP command-surface gaps), Decimal, region discipline, the IAM-policy merge gotcha.
+- [[aws-best-practice]] — *Cowork execution constraints* (ASCII-only bytes; Method A: the ASCII-safe zip), Decimal, region discipline, the IAM-policy merge gotcha.

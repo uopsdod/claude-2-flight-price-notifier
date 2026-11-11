@@ -26,7 +26,7 @@ By the end the student has:
 
 - "啟動 M1.1" / "start M1.1" / "做訂閱功能" / "讓使用者訂閱航線"
 
-Requires M0 done. **Before Step 1, confirm `m0-landing-and-signin-checklist` is green** and `m1-1-subscribe-to-a-plan-prerequisites` is complete (AWS access (`[default]` profile) + Travelpayouts token). If not, load those first.
+Requires M0 done. **Before Step 1, confirm `m0-landing-and-signin-checklist` is green** and `m1-1-subscribe-to-a-plan-prerequisites` is complete (AWS access via the AWS MCP connector + Travelpayouts token). If not, load those first.
 
 ## Execution mode: Cowork vs CLI
 
@@ -36,7 +36,7 @@ AWS resources are created with the `aws` CLI in this skill. In Cowork, use the A
 
 | # | Service | Used for |
 |---|---|---|
-| 5 | AWS (`[default]` profile, user `admin-for-cowork`) | Lambda + API Gateway |
+| 5 | AWS (AWS MCP connector, browser sign-in) | Lambda + API Gateway |
 | 6 | Travelpayouts (`travelpayouts.com`) | flight price API token (used heavily in M1.2; set up now) |
 
 ## Flow structure (what M1.1 builds)
@@ -177,9 +177,9 @@ ddb = boto3.resource("dynamodb").Table("subscriptions")
       "Code":{"ZipFile":"<your one-file handler, JSON-escaped, named index.handler>"}}}}}'
   ```
   Keep it **one file** (PLANS + the put_item inline — no `aws/common/ddb.py` split, or the inline limit/`index.handler` requirement breaks). If you edit the handler later, **re-inline and `update-stack`** — the deployed code is the source of truth, a multi-file local layout will silently diverge.
-- **CLI mode only:** `zip` the handler and `aws lambda create-function --zip-file fileb://fn.zip …` (or `scripts/04_deploy_lambdas.sh`). This path does NOT work in Cowork (the MCP rejects `fileb://` from the workspace).
+- **CLI mode only:** `zip` the handler and `aws lambda create-function --zip-file fileb://fn.zip …` (or `scripts/04_deploy_lambdas.sh`). This path does NOT work in Cowork (no local file reaches AWS MCP — use inline CFN or Method A in [[aws-best-practice]]).
 
-**Verify before moving on** — invoke, then read the **row** back (don't try to `cat` the invoke output — in Cowork the MCP can't read the file it wrote, and `invoke` chokes on `--query`/`--cli-binary-format`):
+**Verify before moving on** — invoke, then read the **row** back (in Cowork, AWS MCP returns the invoke `Payload` inline — check it, then confirm the row):
 ```bash
 aws lambda invoke --function-name flight-save-subscription \
   --payload '{"body":"{\"email\":\"test@example.com\",\"plan_name\":\"tokyo\",\"target_price\":10000}"}' \
@@ -223,7 +223,7 @@ Without this, M1.1 is **write-only**: the user clicks 開始追蹤, a row is cre
 5. **PutItem overwrites by key** — re-subscribing the same (email, route) overwrites the row (idempotent). **In M2** this watch-out grows teeth: there, a re-subscribe must NOT clobber an existing `subscription_status` (don't knock a paid user back). In M1 there's no status, so a plain overwrite is fine.
 6. **No payment guard in M1** — M1.1 writes no `subscription_status` at all; everyone who subscribes is eligible for alerts. The paywall (status field + Stripe webhook + active-only filter) is *introduced in M2*. Don't add a status here.
 7. **DynamoDB numbers** — `target_price` stored as a Number; boto3's `resource` API wants `Decimal`, not `float`. Convert (`Decimal(str(target_price))`). See [[aws-best-practice]] Rule 3.
-8. **Cowork MCP gotchas** (the ones that bit a real run — see [[aws-best-practice]] *Cowork execution constraints*): no `fileb://` zip from the workspace → **deploy via inline CFN**; you **can't `cat` the `invoke` output** → verify with `get-item`; `lambda invoke` rejects `--query`/`--cli-binary-format`; JMESPath **backtick literals** fail (`SecretList[?starts_with(Name,\`flight/\`)]` errors — use `SecretList[].Name`); **`git clone` needs a native dir**, not the mounted folder.
+8. **AWS MCP gotchas** (see [[aws-best-practice]] *Cowork execution constraints*): bytes ≥ `0x80` are silently corrupted in blob params, so deploy with **inline CFN** (as written here) or an **ASCII-safe zip** (Method A); `Invoke` returns the payload inline; filter results in Python (no `--query`); logs via `logs FilterLogEvents`; **`git clone` needs a native dir**, not the mounted folder.
 
 ## Expected duration
 

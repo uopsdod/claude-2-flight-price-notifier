@@ -7,7 +7,7 @@ description: Prerequisites before M1.2 of the Flight Price Notifier course — c
 
 ## What this skill does
 
-M1.2 adds **no new accounts** — it reuses M1.1's AWS access (`[default]` profile), the `flight-lambda-role`, the `flight/travelpayouts` secret, and the DynamoDB `subscriptions` + `notification_history` tables. M1.2 *creates* the S3 routes config + the fare SQS queue and *extends* the role with S3/SQS/InvokeFunction perms — this skill just confirms the M1.1 carryover is in place and the Travelpayouts token still works.
+M1.2 adds **no new accounts** — it reuses M1.1's AWS access (the AWS MCP connector), the `flight-lambda-role`, the `flight/travelpayouts` secret, and the DynamoDB `subscriptions` + `notification_history` tables. M1.2 *creates* the S3 routes config + the fare SQS queue and *extends* the role with S3/SQS/InvokeFunction perms — this skill just confirms the M1.1 carryover is in place and the Travelpayouts token still works.
 
 ## Flow structure (where M1.2 sits)
 
@@ -41,26 +41,11 @@ M1.2 builds the **EventBridge → Parser Wrapper → Parser** pipeline (teal) th
 
 ## Execution mode: Cowork (default) vs CLI
 
-This runs mainly in **Cowork** — paste the checks to the agent with the **AWS API MCP** (it runs each `aws` call). On the local CLI, run them directly. Every `aws` command uses `--region us-east-1` and the `[default]` profile (**no `--profile`**). Note: through the MCP, `--query` must **not** use JMESPath backtick literals (they fail to parse) — the queries below avoid them.
+This runs mainly in **Cowork** — paste the checks to the agent with the **AWS MCP** (it runs each `aws` call). On the local CLI, run them directly. Every AWS call uses `us-east-1`. In Cowork there's no `--query`: the agent filters each response in Python.
 
-## Connector-capability probe (do this first — the deploy path branches on it)
+## Deploy path on AWS MCP
 
-M1.2 is the first milestone that ships a Lambda **zip**, and *how you get that zip into S3* depends on what your Cowork AWS connector can do. Find out now, not mid-build:
-
-ask """
->
-Two quick questions about your environment so I pick the right deploy path:
->
-1. Can you author a file and run shell tools like `zip` in a working directory you control, or can you ONLY run `aws ...` commands?
->
-2. Try `aws logs tail --help` — does it work, or is `tail` rejected as an unknown operation?
->
-"""
-
-- **`aws`-only connector (the common case — `logs tail` rejected, no file authoring):** you'll use the **`flight-seed` base64→S3 bridge** (main skill Step 3). The **bash sandbox builds the zip** (needs `zip`), the bridge moves it to S3.
-- **Connector with a writable shell workdir (rare):** you *may* `zip` + `aws s3 cp` directly — but the bridge works in both, so when unsure, use it.
-
-This one check is the difference between a smooth Step 3 and discovering the wall mid-deploy. (See [[aws-best-practice]] *Cowork execution constraints* → Method 2.)
+M1.2 is the first milestone that ships code past the 4096-char inline-CFN cap. On AWS MCP the deploy path is the same for everyone: an **ASCII-safe zip** passed straight to `Code.ZipFile` ([[aws-best-practice]] Method A). No connector probe and no `zip` tool are needed — the helper builds the zip inside the AWS MCP script.
 
 ## Verify (all must pass — fix via the noted M1.1 step if any fail)
 
@@ -80,7 +65,7 @@ Run these M1.1-carryover checks in us-east-1 and show me each result:
 >
 """
 
-> Note the queries use `"Role.RoleName"` / `"SecretList[].Name"` with **no backticks** — the backtick form (`SecretList[?starts_with(Name,\`flight/\`)]`) errors through the MCP. Just eyeball the full name list.
+> Note the queries use `"Role.RoleName"` / `"SecretList[].Name"` — in Cowork the agent runs `ListSecrets` and scans the names in Python.
 
 **Travelpayouts token still works** — the fetch API accepts the token as a `?token=` query param, so it's checkable without a shell. Paste to the agent (swap in your token):
 
@@ -96,7 +81,7 @@ https://api.travelpayouts.com/v1/prices/cheap?origin=TPE&destination=TYO&depart_
 
 > **One token, both currencies.** M1.2's parser fetches each route in **`twd`** (the gate) **and** **`usd`** (the email's supplementary line) — the **same `flight/travelpayouts` token serves both**; no new secret. (You can sanity-check by swapping `currency=twd`/`usd` in the URL above.)
 
-**Build tools** — M1.2 ships a Lambda zip, and **Cowork builds it in the bash sandbox** (the `aws`-only connector can't `zip`), then moves it to S3 via the `flight-seed` bridge. So you **do** need `zip` available in the sandbox: `python3 --version && which zip`. (Only a connector that exposes its own writable shell workdir could skip the sandbox — see the capability probe above.)
+**Build tools** — none extra in Cowork: the `ascii_zip` helper builds the Lambda zip inside the AWS MCP script. (CLI mode needs `zip`: `python3 --version && which zip`.)
 
 - If (1) fails → redo `m1-1-subscribe-to-a-plan-prerequisites` Step 1.
 - If (2)/(3)/(4) fail → redo M1.1 Steps 1–3.

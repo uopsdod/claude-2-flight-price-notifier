@@ -1,6 +1,6 @@
 ---
 name: m1-1-subscribe-to-a-plan-prerequisites
-description: One-time setup before M1.1 of the Flight Price Notifier course — clone the M0 GitHub repo (into a native dir), AWS access (the `[default]` profile via an admin IAM user), and a Travelpayouts token (token only — the affiliate marker is deferred to M1.3 where it's used). Cowork-first; notes the inline-CFN deploy method. Use when the student starts M1.1 for the first time, or when `m1-1-subscribe-to-a-plan` / `-checklist` detects the project, AWS access, or the Travelpayouts token is missing.
+description: One-time setup before M1.1 of the Flight Price Notifier course — clone the M0 GitHub repo (into a native dir), AWS access (the AWS MCP connector, browser sign-in), and a Travelpayouts token (token only — the affiliate marker is deferred to M1.3 where it's used). Cowork-first; notes the inline-CFN deploy method. Use when the student starts M1.1 for the first time, or when `m1-1-subscribe-to-a-plan` / `-checklist` detects the project, AWS access, or the Travelpayouts token is missing.
 ---
 
 # M1.1 Prerequisites — AWS + Travelpayouts
@@ -13,12 +13,12 @@ This course is run mainly in **Cowork** (no local shell — you talk to a Cowork
 
 Sets up the three things M1.1 needs on top of M0's tooling:
 1. **The project in your workspace** — clone the GitHub repo Lovable created in M0, and confirm the push → Vercel auto-deploy loop works end-to-end.
-2. **AWS access** under the `[default]` profile (an admin IAM user you create; name can differ — confirm with `aws sts get-caller-identity`).
+2. **AWS access** through the **AWS MCP** connector (browser sign-in; confirm with `sts GetCallerIdentity`).
 3. A **Travelpayouts API token** (used to fetch fares — set up now, used heavily in M1.2).
 
 Run once. M1.2/M1.3 reuse the same AWS access + the same repo.
 
-> **Heads-up before you build (Cowork):** the AWS API MCP *has* AWS creds + network, but a built **zip can't cross from the bash/build host into the MCP's workdir** (`fileb://…` only reads the MCP's own dir). So **Lambda code is deployed as inline CloudFormation `Code.ZipFile`** (single file, ≤4096 chars, handler `index.handler`) — the code travels *inside* the API call, no file transfer. The `aws lambda create-function --zip-file fileb://…` flow is **CLI-mode only**. Read [[aws-best-practice]] *Cowork execution constraints* once before M1.1 Step 4 — it's the difference between a smooth run and an hour of "outside allowed working directory" errors.
+> **Heads-up before you build (Cowork):** the AWS MCP *has* AWS access, but a zip built in the bash sandbox **can't reach it**, and AWS MCP **silently corrupts every byte ≥ `0x80`** in blob parameters. So **Lambda code is deployed as inline CloudFormation `Code.ZipFile`** (single file, ≤4096 chars, handler `index.handler`) or as an **ASCII-safe zip** (Method A in [[aws-best-practice]]) — the code travels *inside* the API call, no file transfer. The `aws lambda create-function --zip-file fileb://…` flow is **CLI-mode only**. Read [[aws-best-practice]] *Cowork execution constraints* once before M1.1 Step 4 — it's the difference between a smooth run and an hour of silently corrupted zips.
 
 ## Flow structure (where M1.1 sits)
 
@@ -92,56 +92,26 @@ Here is my GitHub Personal Access Token: XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 
 > **Why this matters:** every later milestone edits this repo (the subscribe form in M1.1, etc.) and relies on `git push → Vercel redeploy`. If that loop is broken, nothing you build after will reach the live site — so prove it here, once.
 
-## Step 1 — AWS access (AWS API MCP + the `[default]` profile)
+## Step 1 — AWS access (AWS MCP connector, browser sign-in)
 
-This is the AWS setup for the whole course. Two parts: **install the connector**, then **write credentials** (via a one-time Claude Code CLI session — the Cowork AWS API MCP then reads them).
+This is the AWS setup for the whole course. AWS MCP signs you in through your browser (OAuth): **no IAM user, no access key, no `~/.aws/credentials`, no Claude Code CLI session.**
 
-### 1a — Add the AWS API MCP connector (Cowork)
+### 1a — Connect the AWS MCP connector (Cowork)
 
-> **Customize → Connectors → search "AWS API MCP" → Install.**
+1. Make sure you can sign in to the course AWS account as the **root user** (the email + password you signed up with).
+2. Cowork → **Customize → Connectors**. If **AWS API MCP** is installed, **disable** it (the old access-key connector — don't run both).
+3. **Add → AWS MCP**, server URL: `https://aws-mcp.us-east-1.api.aws/mcp?oauth=initialize`
+4. **Continue → Add → Connect → Continue** → wait for **Connecting…**
+5. **Sign into new session** → a browser window opens → sign in as the **root user**.
+6. When Cowork shows **Needs approval** → **Always allow**.
 
-This is the tool Cowork uses to run every `aws` call in the course (it reads your local `~/.aws/credentials`).
+### 1b — Verify
 
-### 1b — Create an admin IAM user + write its key to the `[default]` profile
+Ask the agent: *"How many IAM users do I have now on my AWS account?"* — a number (0 is normal on a fresh account) means the connector works. The agent can also run `sts GetCallerIdentity` (`region_name="us-east-1"`) and show the Account ID. If Claude says the AWS tool isn't available or the sign-in expired, redo steps 4–6. Every course AWS call pins `us-east-1`.
 
-1. **Sign in to the AWS Console as the *root* user** of your course AWS account (e.g. email `uops...@gmail.com`).
-2. **IAM → Users → Create user** (suggested name **`admin-for-cowork`** — any name is fine) → attach the **`AdministratorAccess`** policy → create.
-3. That user → **Security credentials → Create access key → "Command Line Interface (CLI)"** → copy the **Access key ID + Secret access key** (shown **once**).
-4. **Open a Claude Code CLI session** (指令版) and paste this — it writes the `[default]` profile to `~/.aws/credentials` (preserving any other profiles) and tests the connection:
+> At course end there's no key to revoke — remove the AWS MCP connector in Customize → Connectors. If you created an IAM user + access key for the old AWS API MCP, deactivate and delete that key once AWS MCP works.
 
-   ask """
-   >
-   I have new AWS credentials I want to configure. Please write them to my AWS credentials file. Here are the values:
-   >
-   Access key ID: <YOUR_ACCESS_KEY_ID>
-   >
-   Secret access key: <YOUR_SECRET_ACCESS_KEY>
-   >
-   First, detect whether I'm on Mac/Linux or Windows to determine the correct credentials file path
-   (~/.aws/credentials on Mac/Linux, %USERPROFILE%\.aws\credentials on Windows),
-   then write the [default] profile with the new values — preserving any other existing profiles in the file.
-   >
-   Once done, test the connection using aws sts get-caller-identity.
-   >
-   """
-
-**Verify:** `aws sts get-caller-identity` returns an Account ID and an `Arn` ending in **your admin user's name** (whatever you named it). That `sts` call — not a hardcoded name — is the source of truth that the `[default]` profile is wired. After this, the Cowork AWS API MCP can run every course `aws` command (always with `--region us-east-1` — no `--profile` needed, it's `[default]`).
-
-> ⚠️ **Root is used only once** — to create the admin IAM user. After that, never use root keys. The access key is shown **once**; if you lose it, delete it and make a new one. **Revoke that key when the course ends.** The `[default]` profile has no region, which is why every course command pins `--region us-east-1`.
-
-## Step 2 — Travelpayouts token
-
-M1.1 (and the fetch API) only need the **token** — collect just that now.
-
-1. Sign up free at https://www.travelpayouts.com/ and connect the **Aviasales** program.
-2. Dashboard → **Profile → API token** → copy the **token**. (https://app.travelpayouts.com/profile/api-token)
-3. (You'll store it as `{"token":…}` in the `flight/travelpayouts` secret during M1.1 Step 2.)
-
-> **Not the marker yet.** The Travelpayouts **marker** (affiliate ID, e.g. `736582`) is only used for **booking-link attribution in the M1.3 alert email** — the fetch API authenticates on the token alone (the token-check URL below returns `"success":true` with no marker). You probably don't have the marker handy now, and forcing it here just means storing a placeholder. **M1.3's prereq collects the marker** and updates this secret when it's actually consumed.
-
-**Verify the token works** — the API accepts the token as a `token=` query param, so it's checkable without a shell:
-
-- **Cowork** (no CLI) — paste this to the agent (swap in your token):
+ste this to the agent (swap in your token):
 
   ask """
   >

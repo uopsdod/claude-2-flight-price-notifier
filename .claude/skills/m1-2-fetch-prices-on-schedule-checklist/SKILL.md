@@ -29,7 +29,7 @@ Confirms M1.2 really works: routes load from S3, the parser fetches real fares +
 
 ## Execution mode
 
-Mainly **Cowork** — paste each check to the agent with the **AWS API MCP**; CLI mode runs the same `aws` lines directly. All commands `--region us-east-1`, `[default]` profile (no `--profile`). Two Cowork rules apply here: **don't try to read an `aws lambda invoke` output file** (the MCP can't read it back) — verify the **effect** (logs / queue depth); and **no JMESPath backtick literals** in `--query`.
+Mainly **Cowork** — paste each check to the agent with the **AWS MCP**; CLI mode runs the same `aws` lines directly. All commands `--region us-east-1` (no `--profile`). On AWS MCP, `Invoke` returns the payload inline (read it, then confirm the **effect** — logs / queue depth), and there's no `--query`: filter responses in Python.
 
 ## How to run
 
@@ -45,11 +45,7 @@ Run each check, report results. (Seed a test subscriber whose `target_price` is 
   ```bash
   aws sqs get-queue-url --queue-name flight-fare-queue --region us-east-1
   ```
-- **A3** The zips were uploaded to S3 (the Cowork deploy artifacts, via the `flight-seed` bridge):
-  ```bash
-  aws s3 ls s3://flight-config-<ACCOUNT_ID>/lambda/ --region us-east-1
-  ```
-  Expect `parser.zip` and `wrapper.zip` — and their **byte sizes should equal the local zips** (a mangled base64 seed yields a same-name but wrong-size object → `InvalidZipFileException` at deploy). Absent → the Step 3 `flight-seed` upload didn't run; the functions can't have deployed from S3.
+- **A3** Deployed code is healthy: `lambda GetFunction` for `flight-parser` and `flight-parser-wrapper` shows `State=Active`, `LastUpdateStatus=Successful` and a non-zero `CodeSize`. (Only if a zip was deployed from S3 via the optional `flight-seed` bridge: also require that object's **ETag == the local md5**.)
 
 ### Section B — Lambdas exist & run
 - **B1** Both functions exist:
@@ -57,15 +53,15 @@ Run each check, report results. (Seed a test subscriber whose `target_price` is 
   aws lambda get-function --function-name flight-parser --region us-east-1 --query 'Configuration.FunctionName'
   aws lambda get-function --function-name flight-parser-wrapper --region us-east-1 --query 'Configuration.FunctionName'
   ```
-- **B2** Parser invoke succeeds for one route — **verify by logs, not the output file** (in Cowork the MCP can't read the file `invoke` writes; `invoke` also rejects `--query`/`--cli-binary-format`):
+- **B2** Parser invoke succeeds for one route — read the returned `Payload` (AWS MCP returns it inline) and the logs:
   ```bash
   aws lambda invoke --function-name flight-parser \
     --payload '{"origin":"TPE","destination":"TYO","route":"TPE-TYO"}' out.json \
     --region us-east-1
   # the real check is B3's logs (a clean run, no Runtime.ImportModuleError / AccessDeniedException)
   ```
-  A `Runtime.ImportModuleError` here = a file missing from the S3 zip (re-do main Step 3); `AccessDeniedException` = the Step 1 role merge dropped a statement.
-- **B3** Logs show a realistic cheapest fare per route (`logs tail` is rejected by the MCP — use `filter-log-events`):
+  A `Runtime.ImportModuleError` here = the deployed zip is wrong (re-do main Step 3b); `AccessDeniedException` = the Step 1 role merge dropped a statement.
+- **B3** Logs show a realistic cheapest fare per route (AWS MCP: `logs FilterLogEvents`):
   ```bash
   aws logs filter-log-events --log-group-name /aws/lambda/flight-parser \
     --query "events[].message" --region us-east-1
@@ -127,7 +123,7 @@ Run each check, report results. (Seed a test subscriber whose `target_price` is 
 **Verdict:**
 - All ✅ → 「M1.2 驗收通過 ✅ READY for M1.3。跟我說『啟動 M1.3』。」
 - Any ❌ → name failures + recovery:
-  - **`Runtime.ImportModuleError` / `InvalidZipFileException`** → the S3 zip is bad (often a mangled base64 seed → wrong object size). Re-run the **`flight-seed` upload** (main Step 3b) and confirm the S3 object byte size **equals** the local zip, then `update-function-code --s3-bucket/--s3-key`.
+  - **`Runtime.ImportModuleError` / `InvalidZipFileException` / `Uploaded file must be a non-empty zip`** → the zip had bytes ≥ `0x80`; redeploy with Method A (`ascii_zip`, main Step 3b), then confirm `LastUpdateStatus=Successful`.
   - **Function stuck `State=Failed`** (a create that failed on a bad zip) → `update-function-code` is **blocked**; you must `aws lambda delete-function` and **recreate** it (re-do Step 3c) once the zip is good.
   - **`AccessDeniedException`** → the Step 1 `put-role-policy` merge dropped a statement; re-apply `flight-data` with S3 (Get+**Put**) + SQS + InvokeFunction **and** the original DynamoDB+Secrets.
   - **Empty fares despite a live route** → the handler likely parsed the wrong API keys (`departure_at`/`return_at`, not `depart_date`/`return_date`); also check token + next-month + `CONFIG_BUCKET` + the routes JSON in S3. True cache-empty → try another month.
