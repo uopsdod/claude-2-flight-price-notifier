@@ -44,7 +44,7 @@ Assets in this skill (`assets/`):
 
 ## Step 1 — Make sure `GET /prices` exists
 
-If the prerequisites found a `GET /prices` route, skip this step. Otherwise create the Lambda from `assets/flight-latest-prices/index.py` the same way earlier milestones deployed Lambdas (zip → S3 `flight-config-<ACCOUNT_ID>/lambda/m4/flight-latest-prices.zip` → check ETag == local md5 → create from S3):
+If the prerequisites found a `GET /prices` route, skip this step. Otherwise create the Lambda from `assets/flight-latest-prices/index.py`. **Cowork (AWS MCP):** use **Method A** in [[aws-best-practice]] — `CreateFunction` with `Code.ZipFile = ascii_zip(<index.py source>)`, same name/runtime/handler/role/timeout/env as below — then run the three API Gateway calls. **CLI:** the commands below, with `--zip-file fileb://flight-latest-prices.zip` in place of the S3 `--code`:
 
 ```bash
 aws lambda create-function --function-name flight-latest-prices --runtime python3.12 --handler index.handler \

@@ -9,7 +9,7 @@ This course's AWS side is **100% serverless** — there is **no EC2, no SSH, no 
 
 When guiding a student through AWS operations, **apply these rules proactively** — stop them before they break one. Each rule maps to a real failure mode of *this* stack.
 
-> **Multi-account variant (M3 go-live):** the AWS MCP uses **one `[default]` profile**, but the **domain's Route 53 hosted zone** can live in a **different AWS account** than the flight project (Lambdas/secrets/API Gateway). When they differ, **switch the `[default]` profile between DNS steps (domain account) and secret/Lambda steps (project account)** — see [[m3-domain-prerequisites]]. For a single-account student this doesn't arise; treat it as the advanced case.
+> **Multi-account variant (M3 go-live):** the AWS MCP is signed in to **one AWS account at a time**, but the **domain's Route 53 hosted zone** can live in a **different AWS account** than the flight project (Lambdas/secrets/API Gateway). When they differ, sign the **AWS MCP** connector into the **domain account** for DNS steps and back into the **project account** for secret/Lambda steps (Customize → Connectors → AWS MCP → reconnect → sign in to that account), and run `sts GetCallerIdentity` before each phase to confirm which account is active *(not yet re-tested on AWS MCP)* — see [[m3-domain-prerequisites]]. For a single-account student this doesn't arise; treat it as the advanced case.
 
 > Adapted from a Course 2 AWS skill that was EC2/SSM-based. Those rules (SSH-vs-SSM, systemd PATH, instance tagging) **do not apply** — this stack has no servers to log into. Only the secrets-hygiene and IAM-user rules carried over; the rest below are serverless-native.
 
@@ -212,7 +212,7 @@ def handler(e, c):
 
 ### Rule 2 — Secrets Manager is the single source of truth for EVERY key — so a fresh Cowork session never re-asks
 
-> **The rule:** **All** API keys/tokens live under **`flight/*` in Secrets Manager** — collected **once**, reused forever. The only credential that must persist *locally* is the **`[default]` AWS profile** (it's how the AWS MCP authenticates); everything else is one `get-secret-value` away. So a new Cowork session re-derives every key from AWS instead of asking you to paste them again. **No keys in code, in committed env files, or anywhere the front-end can be scraped for a *write* secret.**
+> **The rule:** **All** API keys/tokens live under **`flight/*` in Secrets Manager** — collected **once**, reused forever. Nothing persists locally: the **AWS MCP connector's browser sign-in** is the only AWS credential; everything else is one `get-secret-value` away. So a new Cowork session re-derives every key from AWS instead of asking you to paste them again. **No keys in code, in committed env files, or anywhere the front-end can be scraped for a *write* secret.**
 
 **The canonical `flight/*` set:**
 
